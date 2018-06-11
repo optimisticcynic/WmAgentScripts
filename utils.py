@@ -2167,6 +2167,12 @@ class siteInfo:
             else:
                 return ce
 
+    def SE_to_CEs(self, se):
+        if se in self._map_SE_to_CE:
+            return sorted(self._map_SE_to_CE[se])
+        else:
+            return [self.SE_to_CE(se)]
+
     def SE_to_CE(self, se):
         if se in self._map_SE_to_CE:
             return sorted(self._map_SE_to_CE[se])[0]
