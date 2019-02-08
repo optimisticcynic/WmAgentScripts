@@ -19,6 +19,7 @@ dated_log=$HTML_DIR/logs/$modulename/`date +%F_%T`.log
 log=$dated_log
 
 echo `date` > $log
+echo $$ >> $log
 
 if [ -r unified_drain ] ; then
     echo "System is locally draining" >> $log
@@ -47,24 +48,27 @@ echo $MCM_SSO_COOKIE >>$log
 echo $X509_USER_PROXY >>$log
 
 source /data/srv/wmagent/current/apps/wmagent/etc/profile.d/init.sh
+# get pymongo
+###the local python fucks up with os.system('cp whatever whatever_on_eos')
+export PYTHONPATH=$PYTHONPATH:/usr/lib64/python2.7/site-packages
+
 
 echo >> $log
 
 start=`date +%s`
-echo $modulename:`date` >> $FINAL_HTML_DIR/logs/running
-echo $modulename:`date` > $FINAL_HTML_DIR/logs/last_running
+python ssi.py $modulename $start
+
 python $* &>> $log
 
 if [ $? == 0 ]; then
     echo "finished" >> $log
 else
     echo "abnormal termination" >> $log
-    mail -s "[Ops] module "$modulename" failed" -a $log vlimant@cern.ch,matteoc@fnal.gov,thong.nguyen@cern.ch,svenja.pflitsch@desy.de
+    mail -s "[Ops] module "$modulename" failed" -a $log matteoc@fnal.gov,thong.nguyen@cern.ch,svenja.pflitsch@desy.de
 fi
 
 stop=`date +%s`
-let stop=stop-start
-echo $modulename:$start:$stop > $FINAL_HTML_DIR/logs/$modulename/`date +%s`.time
+python ssi.py $modulename $start $stop
 echo `date` >> $log
 
 #cp $log $dated_log

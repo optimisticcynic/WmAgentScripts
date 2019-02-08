@@ -1,5 +1,5 @@
 #!/usr/bin/env python  
-from utils import workflowInfo, getWorkflows, sendEmail, componentInfo, monitor_dir, reqmgr_url, siteInfo, sendLog, getWorkflowById, isHEPCloudReady, agentInfo, unifiedConfiguration, monitor_eos_dir, base_eos_dir
+from utils import workflowInfo, getWorkflows, sendEmail, componentInfo, monitor_dir, reqmgr_url, siteInfo, sendLog, getWorkflowById, isHEPCloudReady, agentInfo, unifiedConfiguration, monitor_eos_dir, base_eos_dir, batchInfo
 
 from assignSession import *
 import reqMgrClient
@@ -42,7 +42,7 @@ if N_for_cloud:
 #os.system('Unified/assignor.py --from_status staging RunIISummer16DR80Premix')
 #os.system('Unified/assignor.py --from_status staging RunIISummer16DR80-')
 
-up = componentInfo(mcm=False, soft=['mcm'])                                 
+up = componentInfo(soft=['mcm','wtc'])                                 
 if not up.check(): sys.exit(0)
 
 url = reqmgr_url
@@ -86,7 +86,7 @@ for wf in wfs:
 may_have_one.update( may_have_one_too )
 
 ## keep all relval reports for *ever* ...
-batches = json.loads(open('%s/batches.json'%base_eos_dir).read())
+batches = batchInfo().content()
 for b,pids in batches.items(): 
     for pid in pids:
         wfs = getWorkflowById(url, pid, details=True)
@@ -114,10 +114,17 @@ for (the_dir,logtype) in [(monitor_eos_dir,'report'),
         is_locked = any([d.endswith(wf) for wf in may_have_one])
         if not is_locked:
             ## that can be removed
-            print d,logtype,"file can be removed"
-            os.system('rm -rf %s'%d)
+            print ("Removing {}".format(logtype))
+            cmd = "rm -rf {}".format(d)
+            print(cmd)
+            os.system(cmd)
+            eos_cmd = "eos rm -rf {}".format(d)
+            print(eos_cmd)
+            #print "with eos command"
+            os.system(eos_cmd)
         else:
-            print d,"is still in use"
+            #print d,"is still in use"
+            pass
     
 ## protected lfn list
 os.system('python listProtectedLFN.py')

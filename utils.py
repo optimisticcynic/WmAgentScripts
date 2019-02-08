@@ -52,6 +52,7 @@ url_eos = unified_url_eos
 #unified_pub_url = os.getenv('UNIFIED_URL','https://vocms049.cern.ch/unified/public/')
 unified_pub_url = os.getenv('UNIFIED_URL','https://cms-unified.web.cern.ch/cms-unified/public/')
 cache_dir = '/data/unified-cache/'
+mongo_db_url = 'vocms0274.cern.ch'
 
 FORMAT = "%(module)s.%(funcName)s(%(lineno)s) => %(message)s (%(asctime)s)"
 DATEFMT = "%Y-%m-%d %H:%M:%S"
@@ -400,7 +401,7 @@ def sendEmail( subject, text, sender=None, destination=None ):
     else:
         destination = list(set(destination+email_destination))
     if not sender:
-        map_who = { 'vlimant' : 'vlimant@cern.ch',
+        map_who = { #'vlimant' : 'vlimant@cern.ch',
                     'mcremone' : 'matteoc@fnal.gov',
                     'qnguyen' : 'thong.nguyen@cern.ch'
                     }
@@ -615,37 +616,45 @@ def listSubscriptions(url, dataset, within_sites=None):
     return destinations
 
 def pass_to_dynamo( items, N ,sites = None, group = None ):
-    try:
-        return _pass_to_dynamo( items, N, sites, group)
-    except Exception as e:
-        print "Failed to pass %s to dynamo"% items
-        print str(e)
-        return False
+    check_N_times = 1
+    while True:
+        check_N_times-=1
+        try:
+            return _pass_to_dynamo( items, N, sites, group)
+        except Exception as e:
+            if check_N_times<=0:
+                print "Failed to pass %s to dynamo"% items
+                print str(e)
+                return False
 
 def _pass_to_dynamo( items, N ,sites = None, group = None ):
+    start = time.mktime(time.gmtime())
     if sites == None or sites == []:
         sites = ['T2_*','T1_*_Disk']
     if type(items)==str:
         items = items.split(',')
-    conn  =  httplib.HTTPSConnection('dynamo.mit.edu', cert_file = os.getenv('X509_USER_PROXY'), key_file = os.getenv('X509_USER_PROXY'))
+    conn = make_x509_conn('dynamo.mit.edu')
     par = {'item' : items, 'site': sites, 'n':N}
     if group:
         par.update( {'group' : group })
     #params = urllib.urlencode(par)
     print par
     #print params
+    par.update({'cache':'y'})
     conn.request("POST","/registry/request/copy", json.dumps(par))
     response = conn.getresponse()
     data = response.read()
     #print data
+    stop = time.mktime(time.gmtime())
+    print stop-start,"[s] to hand over to dynamo of",items
     try:
         res = json.loads( data )
         #print json.dumps( res, indent=2)
         return (res['result'] == "OK")
     except Exception as e:
-        if data.replace('\n','') == '':
-            print "consider blank as OK"
-            return True
+        #if data.replace('\n','') == '':
+        #    print "consider blank as OK"
+        #    return True
         print "Failed _pass_to_dynamo"
         print "---"
         print data
@@ -653,15 +662,168 @@ def _pass_to_dynamo( items, N ,sites = None, group = None ):
         print str(e)
         return False
 
-def lock_DDM(lock=True, wait=True, timeout=None):
-    #conn = make_x509_conn('dynamo.mit.edu')
-    conn  =  httplib.HTTPSConnection('dynamo.mit.edu', cert_file = os.getenv('X509_USER_PROXY'), key_file = os.getenv('X509_USER_PROXY'))
+class UnifiedLock:
+    def __init__(self, acquire=True):
+        self.owner = "%s-%s"%(socket.gethostname(), os.getpid())
+        #self.owner = owner
+        if acquire: self.acquire()
+
+    def acquire(self):
+        from assignSession import session, LockOfLock
+        ## insert a new object with the proper time stamp
+        ll = LockOfLock( lock=True, 
+                         time = time.mktime( time.gmtime()),
+                         owner = self.owner)
+        session.add( ll )
+        session.commit()
+
+    def deadlock(self):
+        host = os.getenv('HOST',os.getenv('HOSTNAME',socket.gethostname()))
+        from assignSession import session, LockOfLock
+        to_remove = []
+        for ll in session.query(LockOfLock).filter(LockOfLock.lock== True).filter(LockOfLock.owner.contains(host)).all():
+            print ll.owner
+            try:
+                host,pid = ll.owner.split('-')
+                process = os.popen('ps -e -f | grep %s | grep -v grep'%pid).read()
+                if not process:
+                    print "the lock",ll,"is a deadlock"
+                    to_remove.append( ll )
+                else:
+                    print "the lock on",ll.owner,"is legitimate"
+            except:
+                print ll.owner,"is not good"
+
+        if to_remove:
+            for ll in to_remove:
+                session.delete( ll )
+            session.commit()
+
+            
+    def clean(self):
+        ##TODO: remove deadlocks
+        ##TODO: remove old entries to keep the db under control
+        return 
+        now = time.mktime(time.gmtime())
+        from assignSession import session, LockOfLock
+        for ll in session.query(LockOfLock).all():
+            ## one needs to go and check the process on the corresponding machine
+            pass
+        session.commit()
+
+    def __del__(self):
+        self.release()
+
+    def release(self):
+        from assignSession import session, LockOfLock
+        for ll in session.query(LockOfLock).filter(LockOfLock.owner == self.owner).all():
+            ll.lock = False
+            ll.endtime = time.mktime( time.gmtime())
+        session.commit()
+
+
+
+class DynamoLock:
+    def __init__(self, owner=None, wait=True, timeout=None, acquire=True):
+        self.owner = owner
+        self.go = False
+        self.wait = wait
+        self.timeout = timeout
+        if acquire: self.acquire()
+
+    def acquire(self):
+        wait = 30
+        waited = 0 
+        while True:
+            self.go = not self.check()
+            if not self.go and self.wait:
+                waited += wait
+                if self.timeout and waited > self.timeout:
+                    break
+                time.sleep(wait)
+                print "wait on dynamo"
+            break
+
+        print "dynamo lock acquired",self.go
+        #self.go = lock_DDM(owner=self.owner, wait=self.wait, timeout=self.timeout)
+
+    def free(self):
+        return self.go
+
+    def check(self):
+        retry = 3
+        while retry:
+            try:
+                return self._check()
+            except:
+                print "Failed to check on dynamo",retry
+                retry-=1
+                time.sleep(5)
+        return True
+                
+            
+    def _check(self):
+        conn = make_x509_conn('dynamo.mit.edu')
+        r1 = conn.request("GET",'/data/applock/check?app=detox')
+        r2 = conn.getresponse()
+        r = json.loads(r2.read())
+        if (r['result'] == 'OK' and r['message'] == 'Locked'):
+            print "waiting on dynamo",r
+            locked = True
+        else:
+            locked = False
+        return locked
+
+    def deadlock(self):
+        from assignSession import session, LockOfLock
+        Ulocks = session.query(LockOfLock).filter(LockOfLock.lock == True).all()
+        if not Ulocks:
+            ## noone on this end is currently supposed to handshake with dynamo
+            # does not work out 
+            self.full_release()
+
+    def __del__(self):
+        if self.go: self.release()
+
+    def release(self):
+        #unlock_DDM(self.owner)
+        pass
+
+    def full_release(self):
+        ## release as many times as necessary to get it free
+        while self.check():
+            self.release()
+
+def unlock_DDM(owner=None):
+    try:
+        return _lock_DDM(owner=owner, lock=False, wait=None, timeout=None)
+    except Exception as e:
+        print "Failure in unlocking DDM"
+        print str(e)
+        return False
+
+def lock_DDM(owner=None, wait=True, timeout=None):
+    try:
+        return _lock_DDM(owner=owner, lock=True, wait=wait, timeout=timeout)
+    except Exception as e:
+        print "Failure in locking DDM"
+        print str(e)
+        return False
+
+
+def _lock_DDM(owner=None, lock=True, wait=True, timeout=None):
+    print "deprecated"
+    sys.exit(5)
+    return
+    conn = make_x509_conn('dynamo.mit.edu')
     go = False
     waited = 0
     sleep = 30
+    service = 'unified' ## could be replaced with some owner
+    if owner: service+= '-'+owner
     if lock:
         while True:
-            conn.request("POST","/registry/applock/lock?service=unified&app=detox")
+            conn.request("POST","/registry/applock/lock?service=%s&app=detox"% service )
             response = conn.getresponse()
             data = response.read()
             res = json.loads( data )
@@ -669,7 +831,7 @@ def lock_DDM(lock=True, wait=True, timeout=None):
                 time.sleep( sleep )
                 waited += sleep
             elif res['result'].lower() == 'ok':
-                print "we locked dynamo for unified"
+                print "we locked dynamo for",service
                 go = True
                 break
             else:
@@ -677,17 +839,18 @@ def lock_DDM(lock=True, wait=True, timeout=None):
                 print res
                 break
             if timeout and waited>timeout:
-                print "locking dynamo for unified has timedout"
+                print "locking dynamo has timedout for",service
                 go = False
     else:
-        conn.request("POST","/registry/applock/unlock?service=unified&app=detox")
+        conn.request("POST","/registry/applock/unlock?service=%s&app=detox"% service)
         response = conn.getresponse()
         data = response.read()
         res = json.loads( data )
         if res['result'].lower() == 'ok':
-            print "we unlocked dynamo for unified"
+            print "we unlocked dynamo for",service
             go = True
         else:
+            print 'possible deadlock on',service
             print res
             go = True
 
@@ -697,97 +860,13 @@ def lock_DDM(lock=True, wait=True, timeout=None):
 
 class lockInfo:
     def __init__(self, andwrite=True):
-        self.lockfilename = 'globallocks' ## official name
-        self.writeondelete = andwrite
         self.owner = "%s-%s"%(socket.gethostname(), os.getpid())
-        ## should lock on DDM. this waits for dynamo to not be running
-        #if not lock_DDM( timeout = 30*60): ## 30 minutes timeout
-        #    print "Dynamo is preventing us to run"
-        #    sys.exit(13)
-
-        self.self_lock = '%s/%s.json.%s.lock'%(monitor_pub_dir,self.lockfilename,self.owner)
-        if os.path.isfile( self.self_lock ):
-            print "file",self.self_lock,"is already present"
-            sys.exit(-1)
-
-        self.pub_lock = '%s/%s.json.lock'%(monitor_pub_dir, self.lockfilename)
-        if self.writeondelete:
-            print "setting global lock at",self.pub_lock
-            os.system('echo `date` > %s'% self.pub_lock)
-            print "setting lock lock at", self.self_lock
-            os.system('echo `date` > %s'% self.self_lock)
-
-
+        self.ddmlock = DynamoLock( owner = None, timeout = 10*60)
+        self.unifiedlock = UnifiedLock()
 
     def free(self):
-        started = time.mktime(time.gmtime())
-        max_wait = 50. #120*60. #2h
-        sleep_time = 30
-        locked = False
-        while True:
-            r = os.popen('curl -s http://t3serv001.mit.edu/~cmsprod/IntelROCCS/Detox/inActionLock.txt').read()
-            if not ('Not Found' in r):
-                sendLog('LockInfo','DDM lock is present\n%s'%(r),level='warning')
-                locked = True
-                now = time.mktime(time.gmtime())
-                if (now-started) > max_wait: break
-                else:
-                    print "pausing"
-                    time.sleep(sleep_time)
-            else:
-                locked = False
-                break
-
-        return (not locked)
-
-    def __del__(self):
-        try:
-            ## let dynamo know that we are done here"
-            lock_DDM( lock = False)
-        except Exception as e:
-            #sendEmail('lockInfo','Issue handshaking with dynamo\n%s'%(str(e)))
-            pass
-
-        ## produce the lock file on disk
-        try:
-            from assignSession import session, Lock
-            out = []
-            detailed_out = {}
-            all_locks = session.query(Lock).filter(Lock.lock == True).all()
-            print len(all_locks),"existing locks"
-            for lock in all_locks:
-                if lock.lock:
-                    out.append( lock.item )
-                    detailed_out[lock.item] = { 'date' : lock.time,
-                                                'reason' : lock.reason
-                                                }
-                else:
-                    #print "poping",lock.item
-                    pass
-                    ## let's not do that for now
-                    #session.delete( lock )
-                    #session.commit()
-
-            #print "writing to json"
-            if self.writeondelete:
-                print "writing",len( out ),"locks to the json interface"
-                open('%s/%s.%s.json.new'%(monitor_pub_dir,self.lockfilename,self.owner),'w').write( json.dumps( sorted(out) , indent=2))
-                os.system('mv %s/%s.%s.json.new %s/%s.json'%(monitor_pub_dir,self.lockfilename,self.owner,monitor_pub_dir,self.lockfilename))
-                open('%s/%s.%s.detailed.json.new'%(monitor_pub_dir,self.lockfilename,self.owner),'w').write( json.dumps( detailed_out , indent=2))
-                os.system('mv %s/%s.%s.detailed.json.new %s/%s.detailed.json'%(monitor_pub_dir,self.lockfilename,self.owner,monitor_pub_dir,self.lockfilename))
-                ## remove the owned instance
-                os.system('rm -f %s'% self.self_lock)
-                ##check for other locking instances
-                lock_present = glob.glob('%s/globallocks.json.*.lock'% monitor_pub_dir)
-                print "the following lock lock files are present",sorted(lock_present)
-                if not lock_present:
-                    os.system('rm -f %s'%self.pub_lock)
-                else:
-                    print "was unable to remove global lock because of",len(lock_present),"lock locks"
-        except Exception as e:
-            print "Failed writing locks"
-            print str(e)
-
+        return self.ddmlock.free()
+        
     def release(self, item ):
         try:
             self._release(item)
@@ -812,6 +891,9 @@ class lockInfo:
         return (l and l.lock)
 
     def _lock(self, item, site, reason):
+        if not item:
+            sendEmail('lockInfo', "trying to lock item %s" % item)
+            
         #from dataLock import locksession, Lock
         from assignSession import session, Lock
         l = session.query(Lock).filter(Lock.item == item).first()
@@ -867,22 +949,182 @@ class lockInfo:
         print "------"+"-"*len(comment)
 
 
+def mongo_client():
+    import pymongo,ssl
+    return pymongo.MongoClient('mongodb://%s/?ssl=true'%mongo_db_url, ssl_cert_reqs=ssl.CERT_NONE)
+
+class statusHistory:
+    def __init__(self):
+        self.client = mongo_client()
+        self.db = self.client.unified.statusHistory
+
+    def content(self):
+        c = {}
+        for doc in self.db.find():
+            c[int(doc['time'])] = doc
+        return c
+
+    def add(self, now, info):
+        info['time'] = time.mktime(now)
+        info['date'] = time.asctime(now)
+        self.db.insert_one( info )
+
+    def trim(self, now, days):
+        now = time.mktime(now)
+        for doc in self.db.find():
+            if (float(now)-float(doc['time'])) > days*24*60*60:
+                print "trim history of",doc['_id']
+                self.db.delete_one( {'_id' : doc['_id']})
+
+            
+class replacedBlocks:
+    def __init__(self):
+        self.client = mongo_client()
+        self.db = self.client.unified.replacedBlocks
+
+    def add(self, blocks):
+        for block in blocks:
+            self.db.update_one({'name' : block},
+                               {'$set' : {'name' : block,
+                                          'time' : time.mktime( time.gmtime() )
+                                      }},
+                               upsert=True)
+            
+    def test(self, block):
+        ## return "already replaced"
+        b = self.db.find_one({'name' : block})
+        return True if b else False
+    
+class transferDataset:
+    def __init__(self):
+        self.client = mongo_client()
+        self.db = self.client.unified.transferDataset
+        self.added = set()
+
+        ## one time sync
+        #for k,v in json.loads(eosRead('/eos/cms/store/unified/datasets_by_phid.json')).items():
+        #    self.add(int(k),v)
+            
+    def add(self, phedexid, datasets):
+        self.added.add( phedexid )
+        self.db.update({'phedexid' :phedexid},
+                       {'$set' : { 
+                           'phedexid' :phedexid,
+                           'datasets' : datasets}},
+                       upsert = True)
+
+    def content(self):
+        r = {}
+        for t in self.db.find():
+            r[t['phedexid']] = t['datasets']
+        return r
+
+    def __del__(self):
+        if self.added:
+            phids = [t['phedexid'] for t in self.db.find()]
+            for phid in phids:
+                if not phid in self.added:
+                    while self.db.find_one({'phedexid' : phid}):
+                        self.db.delete_one({'phedexid' : phid})
+                        
+        
+class transferStatuses:
+    def __init__(self):
+        self.client = mongo_client()
+        self.db = self.client.unified.cachedTransferStatuses
+
+    def pop(self, phedexid):
+        self.db.delete_one({'phedexid' : phedexid})
+
+    def add(self, phedexid, status):
+        to_insert = copy.deepcopy( status )
+        to_insert['phedexid'] = phedexid
+        self.db.update_one( {'phedexid' : phedexid},
+                            {"$set": to_insert },
+                            upsert=True
+        )
+
+    def all(self):
+        all = self.db.find()
+        if all:
+            return [d['phedexid'] for d in all ]
+        else:
+            return []
+
+    def content(self):
+        rd = {}
+        for d in self.db.find():
+            d.pop('_id')
+            ii = d.pop('phedexid')
+            rd[ii] = dict(d)
+        return rd
+
+class StartStopInfo:
+    def __init__(self):
+        self.client = mongo_client()
+        self.db = self.client.unified.startStopTime
+        
+    def pushStartStopTime(self, component, start, stop):
+        doc = { 'component' : component,
+                'start' : int(start),
+            }
+        if stop is not None:
+            doc.update({
+                'stop' : int(stop),
+                'lap' : int(stop)-int(start)
+            })
+        
+        self.db.update_one( {'component': component, 'start' : int(start)},
+                            {"$set": doc},
+                            upsert = True)
+
+    def get(self, component, metric='lap'):
+        res = [oo[metric] for oo in sorted(self.db.find({'component' : component}), key = lambda o : o['start']) if metric in oo]
+        return res
+        
+    def purge(self, now, since_in_days):
+        then = now - (since_in_days*24*60*60)
+        ## anything older than then => delete
+        for o in self.db.find():
+            if o['start'] < then:
+                print "removing start/stop from",o['_id'],time.asctime(time.localtime( o['start'])), o['component'], o['start']
+                self.db.delete_one({'_id' : o['_id']})
+                
+      
+
+
 class unifiedConfiguration:
     def __init__(self):
-        ## we need that configuration to be available always
-        #self.configs = json.loads(open('%s/WmAgentScripts/unifiedConfiguration.json'%base_dir).read())
-        # get it from the web maybe ?
-        #os.system('cp %s/WmAgentScripts/unifiedConfiguration.json %s/unifiedConfiguration.json'%( base_dir, monitor_dir))
-        #self.configs = json.loads(os.popen('curl -s %s/unifiedConfiguration.json'% unified_pub_url).read())
-        self.configs = json.loads(open('unifiedConfiguration.json').read())
+        self.configs = json.loads(open('unifiedConfiguration.json').read()) ## switch to None once you want to read it from mongodb
+        if self.configs is None:
+            try:
+                self.client = mongo_client()
+                self.db = self.client.unified.unifiedConfiguration
+                quest = self.db.find_one()
+            except:
+                print "could not reach pymongo"
+                self.configs = json.loads(open('unifiedConfiguration.json').read())
 
     def get(self, parameter):
-        if parameter in self.configs:
-            return self.configs[parameter]['value']
+        if self.configs:
+            if parameter in self.configs:
+                return self.configs[parameter]['value']
+            else:
+                print parameter,'is not defined in global configuration'
+                print ','.join(self.configs.keys()),'possible'
+                sys.exit(124)
         else:
-            print parameter,'is not defined in global configuration'
-            print ','.join(self.configs.keys()),'possible'
-            sys.exit(124)
+            found = self.db.find_one({"name": parameter})
+            if found:
+                found.pop("_id")
+                found.pop("name")
+                return found
+            else:
+                availables = [o['name'] for o in self.db.find_one()]
+                print parameter,'is not defined in mongo configuration'
+                print ','.join(availables),'possible'
+                sys.exit(124)
+
 
 def checkDownTime():
     conn = make_x509_conn()
@@ -895,150 +1137,269 @@ def checkDownTime():
     else:
         return False
 
+def checkMemory():
+    ## credits http://fa.bianp.net/blog/2013/different-ways-to-get-memory-consumption-or-lessons-learned-from-memory_profiler/
+    import resource
+    rusage_denom = 1024.
+    mem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / rusage_denom
+    return mem
+
+
 class componentInfo:
-    def __init__(self, block=True, mcm=False,soft=None, keep_trying=False):
-        self.mcm = mcm
-        self.soft = soft
+    def __init__(self, block=True, mcm=None, soft=None, keep_trying=False, check_timeout = 120):
+        self.checks = componentCheck(block, mcm, soft, keep_trying)
+        self.check_timeout = check_timeout
+        # start the checking
+        self.checks.start()
+
+    def check(self):
+        check_start = time.mktime(time.gmtime())
+        # on timeout
+        ping = 10
+        while self.checks.is_alive():
+            now = time.mktime(time.gmtime())
+            if (now-check_start) > self.check_timeout:
+                alarm =  "Timeout in checking the sanity of components %d > %d "%(now-check_start,self.check_timeout)
+                sendLog('componentInfo',alarm, level='critical')
+                return False
+            print "componentInfo, ping",now,check_start,now-check_start
+            time.sleep(ping)
+        
+        self.status = self.checks.status
+        print "componentInfo, going with"
+        print self.checks.go
+        return self.checks.go
+
+class componentCheck(threading.Thread):
+    def __init__(self, block=True, mcm=None, soft=None, keep_trying=False):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        if soft is None:
+            self.soft = ['mcm','wtc', 'mongo'] ##components that are not mandatory
+        else:
+            self.soft = soft
         self.block = block
         self.status ={
             'reqmgr' : False,
             'mcm' : False,
             'dbs' : False,
             'phedex' : False,
-            'cmsr' : False
+            'cmsr' : False,
+            'wtc' : False,
+            'eos' : False,
+            'mongo' : False
             }
         self.code = 0
         self.keep_trying = keep_trying
+        self.go = False
 
-    def check(self):
-        while True:
-            try:
-                print "checking cmsr"
-                from assignSession import session, Workflow
-                all_info = session.query(Workflow).filter(Workflow.name.contains('1')).all()
-                self.status['cmsr'] = True
-                break
-            except Exception as e:
-                self.tell('cmsr')
-                if self.keep_trying:
-                    time.sleep(30)
-                    continue
-                import traceback
-                print traceback.format_exc()
-                print "cmsr database is unreachable"
-                print str(e)
-                if self.block and not (self.soft and 'cmsr' in self.soft):
-                    self.code = 121
-                    return False
-                break
+    def run(self):
+        self.go = self.check()
+        print "componentCheck finished"
 
-        while True:
-            try:
-                print "checking reqmgr"
-                if 'testbed' in reqmgr_url:
-                    wfi = workflowInfo(reqmgr_url,'sryu_B2G-Summer12DR53X-00743_v4_v2_150126_223017_1156')
-                else:
-                    wfi = workflowInfo(reqmgr_url,'pdmvserv_task_B2G-RunIIWinter15wmLHE-00067__v1_T_150505_082426_497')
+    def check_cmsr(self):
+        from assignSession import session, Workflow
+        all_info = session.query(Workflow).filter(Workflow.name.contains('1')).all()
 
-                self.status['reqmgr'] = True
-                break
-            except Exception as e:
-                self.tell('reqmgr')
-                if self.keep_trying:
-                    time.sleep(30)
-                    continue
-                import traceback
-                print traceback.format_exc()
-                print reqmgr_url,"unreachable"
-                print str(e)
-                if self.block and not (self.soft and 'reqmgr' in self.soft):
-                    self.code = 123
-                    return False
-                break
+    def check_reqmgr(self):
+        if 'testbed' in reqmgr_url:
+            wfi = getWorkLoad(reqmgr_url,'sryu_B2G-Summer12DR53X-00743_v4_v2_150126_223017_1156')
+        else:
+            wfi = getWorkLoad(reqmgr_url,'pdmvserv_task_B2G-RunIIWinter15wmLHE-00067__v1_T_150505_082426_497')       
+        name = wfi['RequestName']
+        tests = getWorkflows(reqmgr_url, 'assignment-approved')
 
+    def check_mcm(self):
         from McMClient import McMClient
+        mcmC = McMClient(dev=False)
+        test = mcmC.getA('requests',page=0)
+        time.sleep(1)
+        if not test:
+            raise Exception("mcm is corrupted")
 
-        if self.mcm:
+    def check_dbs(self):
+        dbsapi = DbsApi(url=dbs_url)
+        if 'testbed' in dbs_url:
+            blocks = dbsapi.listBlockSummaries( dataset = '/QDTojWinc_NC_M-1200_TuneZ2star_8TeV-madgraph/Summer12pLHE-DMWM_Validation_DONOTDELETE_Alan_TEST-v1/GEN', detail\
+                                                =True)
+        else:
+            blocks = dbsapi.listBlockSummaries( dataset = '/TTJets_mtop1695_TuneCUETP8M1_13TeV-amcatnloFXFX-pythia8/RunIIWinter15GS-MCRUN2_71_V1-v1/GEN-SIM', detail=True)
+        if not blocks:
+            raise Exception("dbs corrupted")
+
+    def check_phedex(self):
+        if 'testbed' in dbs_url:
+            cust = findCustodialLocation(phedex_url,'/TTJets_mtop1695_TuneCUETP8M1_13TeV-amcatnloFXFX-pythia8/RunIIWinter15GS-MCRUN2_71_V1-v1/GEN-SIM')
+        else:
+            cust = findCustodialLocation(phedex_url,'/TTJets_mtop1695_TuneCUETP8M1_13TeV-amcatnloFXFX-pythia8/RunIIWinter15GS-MCRUN2_71_V1-v1/GEN-SIM')
+
+    def check_wtc(self):
+        from wtcClient import wtcClient
+        WC = wtcClient()
+        a = WC.get_actions()
+        if a is None:
+            raise Exception("No action can be retrieved")
+
+    def check_eos(self):
+        eosfile = base_eos_dir+'/%s-testfile'%os.getpid()
+        oo = eosFile(eosfile)
+        oo.write("Testing I/O on eos")
+        r = oo.close() ## commits to eos
+        if r:
+            r = os.system('rm -f %s'% eosfile)
+            if not r == 0:
+                raise Exception("failed to I/O on eos")
+
+    def check_mongo(self):
+        db = agentInfoDB()
+        infos = [a['status'] for a in db.find()]
+        
+    def check(self):
+        ecode = 120
+        for component in sorted(self.status):
+            ecode+=1
             while True:
                 try:
-                    mcmC = McMClient(dev=False)
-                    print "checking mcm"
-                    test = mcmC.getA('requests',page=0)
-                    time.sleep(1)
-                    if not test:
-                        raise Exception("mcm is corrupted")
-                    else:
-                        self.status['mcm'] = True
-                        break
+                    print "checking on",component
+                    sys.stdout.flush()
+                    getattr(self,'check_%s'%component)()
+                    self.status[component] = True
+                    break
                 except Exception as e:
-                    self.tell('mcm')
+                    self.tell(component)
                     if self.keep_trying:
+                        print "re-checking on",component
                         time.sleep(30)
                         continue
-                    print "mcm unreachable"
+                    import traceback
+                    print traceback.format_exc()
+                    print component,"is unreachable"
                     print str(e)
-                    if self.block and not (self.soft and 'mcm' in self.soft):
-                        self.code = 125
+                    if self.block and not (self.soft and component in self.soft):
+                        self.code = ecode
                         return False
                     break
-        while True:
-            try:
-                print "checking dbs"
-                dbsapi = DbsApi(url=dbs_url)
-                if 'testbed' in dbs_url:
-                    blocks = dbsapi.listBlockSummaries( dataset = '/QDTojWinc_NC_M-1200_TuneZ2star_8TeV-madgraph/Summer12pLHE-DMWM_Validation_DONOTDELETE_Alan_TEST-v1/GEN', detail=True)
-                else:
-                    blocks = dbsapi.listBlockSummaries( dataset = '/TTJets_mtop1695_TuneCUETP8M1_13TeV-amcatnloFXFX-pythia8/RunIIWinter15GS-MCRUN2_71_V1-v1/GEN-SIM', detail=True)
-                    if not blocks:
-                        raise Exception("dbs corrupted")
-                    else:
-                        self.status['dbs'] = True
-                        break
-            except Exception as e:
-                self.tell('dbs')
-                if self.keep_trying:
-                    time.sleep(30)
-                    continue
-                print "dbs unreachable"
-                print str(e)
-                if self.block and not (self.soft and 'dbs' in self.soft):
-                    self.code = 127
-                    return False
-                break
-        while True:
-            try:
-                print "checking phedex"
-                if 'testbed' in dbs_url:
-                    cust = findCustodialLocation(phedex_url,'/TTJets_mtop1695_TuneCUETP8M1_13TeV-amcatnloFXFX-pythia8/RunIIWinter15GS-MCRUN2_71_V1-v1/GEN-SIM')
-                else:
-                    cust = findCustodialLocation(phedex_url,'/TTJets_mtop1695_TuneCUETP8M1_13TeV-amcatnloFXFX-pythia8/RunIIWinter15GS-MCRUN2_71_V1-v1/GEN-SIM')
-                    self.status['phedex'] = True
-                    break
-            except Exception as e:
-                self.tell('phedex')
-                if self.keep_trying:
-                    time.sleep(30)
-                    continue
-                print "phedex unreachable"
-                print str(e)
-                if self.block and not (self.soft and 'phedex' in self.soft):
-                    self.code = 128
-                    return False
-                break
 
         print json.dumps( self.status, indent=2)
+        sys.stdout.flush()
         return True
 
     def tell(self, c):
-        sendLog('componentInfo',"The %s component is unreachable."% c, level='critical')
+        host = socket.gethostname()
+        sendLog('componentInfo',"The %s component is unreachable from %s"%(c, host), level='critical')
         #sendEmail("%s Component Down"%c,"The component is down, just annoying you with this","vlimant@cern.ch",['vlimant@cern.ch','matteoc@fnal.gov'])
+
+def eosRead(filename,trials=5):
+    filename = filename.replace('//','/')
+    if not filename.startswith('/eos/'):
+        print filename,"is not an eos path in eosRead"
+        #sys.exit(2)
+        #return open(filename).read()
+    T=0
+    while T<trials:
+        T+=1
+        try:
+            return open(filename).read()
+        except Exception as e:
+            print "failed to read",filename,"from eos"
+            time.sleep(2)
+            cache = (cache_dir+'/'+filename.replace('/','_')).replace('//','/')
+            r = os.system('cp %s %s'%( filename, cache ))
+            if r==0:
+                return open(cache).read()
+    print "unable to read from eos"
+    #sys.exit(2)
+    return None
+        
+class eosFile(object):
+    def __init__(self, filename, opt='w'):
+        if not filename.startswith('/eos/'):
+            print filename,"is not an eos path"
+            sys.exit(2)
+        self.opt = opt
+        self.eos_filename = filename.replace('//','/')
+        self.cache_filename = (cache_dir+'/'+filename.replace('/','_')).replace('//','/')
+        self.cache = open(self.cache_filename, self.opt)
+
+    def write(self, something):
+        self.cache.write( something )
+        return self
+
+    def close(self):
+        self.cache.close()
+        bail_and_email = True
+        while True:
+            try:
+                print "moving",self.cache_filename,"to",self.eos_filename
+                r = os.system("cp %s %s"%( self.cache_filename, self.eos_filename))
+                if r==0: return True
+                print "not able to copy to eos",self.eos_filename,"with code",r
+                if bail_and_email:
+                    h = socket.gethostname()
+                    print 'eos is acting up on %s on %s. not able to copy %s to eos code %s'%( h, time.asctime(), self.eos_filename, r)
+                    #sendEmail('eosFile','eos is acting up on %s on %s. not able to copy %s to eos code %s'%( h, time.asctime(), self.eos_filename, r))
+                    break
+
+            except Exception as e:
+                print "Failed to copy",self.eos_filename,"with",str(e)
+                if bail_and_email:
+                    h = socket.gethostname()
+                    print 'eos is acting up on %s on %s. not able to copy %s to eos \n%s'%( h, time.asctime(), self.eos_filename, stre(e))
+                    #sendEmail('eosFile','eos is acting up on %s on %s. not able to copy %s to eos \n%s'%( h, time.asctime(), self.eos_filename, stre(e)))
+                    break
+                else:
+                    time.sleep(30)
+        return False
+
+class relvalInfo:
+    def __init__(self):
+        pass
+    def content(self):
+        ## dump the campaign dict out
+        pass
+
+class batchInfo:
+    def __init__(self):
+        self.client = mongo_client()
+        self.db = self.client.unified.batchInfo
+    def update(self, name, a_list):
+        ex = self.db.find_one({'name' : name})
+        if ex:
+            ex['ids'] = list(set(list(ex['ids'])+list(a_list)))
+        else:
+            ex = {'ids': list(a_list)}
+        self.add( name, ex)
+
+    def add(self, name, content):
+        ## update if necessary
+        self.db.update_one({'name' : name},
+                           {"$set": content},
+                           upsert = True
+                       )
+    def content(self):
+        c = {}
+        for o in self.db.find():
+            c[o['name']] = o['ids']
+        return c
+
+    def all(self):
+        return [o['name'] for o in self.db.find()]
+
+    def pop(self, name):
+        self.db.delete_one({'name': name})
 
 class campaignInfo:
     def __init__(self):
-        #this contains accessor to aggreed campaigns, with maybe specific parameters
-        self.campaigns = json.loads(open('%s/WmAgentScripts/campaigns.json'%base_dir).read())
-        self.campaigns.update( json.loads(open('%s/campaigns.relval.json'%base_eos_dir).read()))
-        #SI = siteInfo()
+
+        self.campaigns = {}
+        self.client = mongo_client()
+        self.db = self.client.unified.campaignsConfiguration
+        self.campaigns = self.content()
+
+        # one time conversion of the file on eos to mongodb
+        #for rv,rvc in json.loads(eosRead('%s/campaigns.relval.json'%base_eos_dir)).items():
+        #    self.add( rv, rvc, c_type='relval')
+
         SI = global_SI()
         for c in self.campaigns:
             if 'parameters' in self.campaigns[c]:
@@ -1049,6 +1410,35 @@ class campaignInfo:
                             reg = black[0:-1]
                             self.campaigns[c]['parameters']['SiteBlacklist'].extend( [site for site in (SI.all_sites) if site.startswith(reg)] )
                             #print self.campaigns[c]['parameters']['SiteBlacklist']
+
+    def content(self):
+        uc = {}
+        for c in self.db.find():
+            c.pop("_id")
+            uc[c.pop("name")] = c
+        return uc
+
+    def all(self, c_type = None):
+        return [o['name'] for o in self.db.find() if (c_type == None or o.get('type',None) == c_type)]
+
+    def update(self, c_dict, c_type=None):
+        for k,v in c_dict.items():
+            self.add( k, v, c_type=c_type)
+            
+    def add(self, name, content, c_type=None):
+        ## update if needed
+        content['name'] = name
+        if c_type:
+            content['type'] = c_type
+        self.db.update_one({'name' : name},
+                           {"$set": content},
+                           upsert = True
+                       )
+
+    def pop(self, item_name):
+        print "removing",item_name,"from campaign configuration"
+        #sendEmail('campaignInfo','removing %s from configuration'% item_name, destination=['vlimant@cern.ch'])
+        self.db.delete_one({'name' : item_name})
 
     def go(self, c, s=None):
         GO = False
@@ -1106,34 +1496,73 @@ def notRunningBefore( component, time_out = 60*5 ):
 
 
 class moduleLock(object):
-    def __init__(self,component=None, silent=False, wait=False, max_wait = 18000):
+    def __init__(self,component=None, silent=False, wait=False, max_wait = 18000, locking=True):
         if not component:
             component = sys._getframe(1).f_code.co_name
 
         self.poll = 30
         self.pid = os.getpid()
-        self.lock = '%s/%s.%s.lock'%( base_eos_dir, component, self.pid)
+        self.host = socket.gethostname()
         self.component = component
         self.wait = wait
         self.silent= silent
         self.max_wait = max_wait
-        print "duplicate lock for component",self.component,"at",self.lock
+        self.locking = locking
 
+        self.client = mongo_client()
+        self.db = self.client.unified.moduleLock
+        
+    def check(self, hours_before_kill = 24):
+        host = socket.gethostname()
+        locks = [l for l in self.db.find({'host' : host})]
+        #print [l.get('component') for l in locks]
+        now = time.mktime(time.gmtime())
+        for lock in locks:
+            pid = lock.get('pid',None)
+            print "checking on %s on %s"%( pid, host)
+            on_since = now - lock.get('time',now)
+            if on_since > (hours_before_kill*60*60):
+                alarm = "process %s on %s for module %s is running since %s : killing"%( pid, host, lock.get('component',None), display_time( on_since))
+                sendLog('heartbeat', alarm, level='critical')
+                os.system('sudo kill -9 %s'%(pid))
+                time.sleep(2)
+            if not os.path.isdir('/proc/%s'% pid):
+                alarm = "process %s is not present on %s"%( pid, host)
+                sendLog('heartbeat', alarm, level='critical')
+                self.db.delete_one({ '_id' : lock.get('_id',None)})
+
+
+    def all_locks(self):
+        locks = [l for l in self.db.find()]
+        print "module locks available in mongodb"
+        print sorted(locks)
+        
+    def clean(self, component=None, pid=None, host=None):
+        sdoc = {'component' : component}
+        if pid is not None:
+            sdoc.update({'pid' : pid})
+        if host is not None:
+            sdoc.update({'host' : host})
+        self.db.delete_many( sdoc )
+               
     def __call__(self):
+        print "module lock for component",self.component,"from mongo db"
         polled = 0
         nogo = True
         locks = []
         i_try = 0
         while True:
-            ## check on existing such files
-            locks = glob.glob('%s/%s.%s.lock'%( base_eos_dir, self.component, '*'))
-            if len(locks):
-                ## something is in the way
+            if not self.locking:
+                nogo = False
+                break
+            ## check from existing such lock, solely based on the component, nothing else
+            locks = [l for l in self.db.find({'component' : self.component})]
+            if locks:
                 if not self.wait:
                     nogo =True
                     break
                 else:
-                    print "Waiting for other %s components to stop running \n%s" % (self.component , sorted(locks))
+                    print "Waiting for other %s components to stop running \n%s" % ( self.component , locks)
                     time.sleep( self.poll )
                     polled += self.poll
             else:
@@ -1141,77 +1570,38 @@ class moduleLock(object):
                 nogo = False
                 break
             i_try += 1
-            if max_wait and polled > max_wait:
-                print "stop waiting for %s to be released \n%s"% ( self.component , sorted(locks))
+            if self.max_wait and polled > self.max_wait:
+                print "stop waiting for %s to be released"% ( self.component )
                 break
-
         if not nogo:
-            ## insert a lock file here
-            l = open( self.lock, 'w')
-            l.write("""%s
-%d
-"""%(time.asctime(time.gmtime()),
-     self.pid))
-            l.close()
+            ## insert a lock doc
+            n = time.gmtime()
+            now = time.mktime( n )
+            nows = time.asctime( n )
+            lockdoc = {'component' : self.component,
+                       'host' : self.host,
+                       'pid' : self.pid,
+                       'time' : now,
+                       'date' : nows}
+            self.db.insert_one( lockdoc )
+            #print lockdoc
         else:
             if not self.silent:
-                msg = 'There are %s instances running. Tried for %d [s] \n%s'%(len(locks),
-                                                                               polled,
-                                                                               sorted(locks))
-                sendEmail('overlapping %s'%self.component, msg)
+                msg = 'There are %s instances running.Possible deadlock. Tried for %d [s] \n%s'%(len(locks),
+                                                                                                 polled,
+                                                                                                 locks)
+                sendLog('heartbeat', msg , level='critical')
                 print msg
+
+
         return nogo
 
     def __del__(self):
-        #remove the lock file
-        os.system('rm -f %s'% self.lock )
-
-
-def duplicateLock(component=None, silent=False, wait=False, max_wait = 18000, max_concurrent=1):
-    ## us the new module locking. requires a full drain so that all locks are set properly
-    if False:
-        ml = moduleLock( component = component,
-                         silent = silent,
-                         wait = wait,
-                         max_wait = max_wait)
-        return ml()
-
-    if not component:
-        ## get the caller
-        component = sys._getframe(1).f_code.co_name
-
-
-    poll = 30 #s
-    polled = 0
-    nogo = True
-    i_try = 0
-    while True:
-        ## check that no other instances of assignor is running
-        process_check = filter(None,os.popen('ps -f -e | grep %s.py | grep -v grep  |grep python'%component).read().split('\n'))
-        if len(process_check)>max_concurrent:
-            ## another component is running on the machine : stop
-            if not wait:
-                nogo = True
-                break
-            else:
-                print "Waiting for other %s components to stop running" % component
-                time.sleep( poll )
-                polled += poll
-        else:
-            ## the only way to return False is here
-            nogo = False
-            break
-        i_try += 1
-        if max_wait and polled > max_wait:
-            break
-
-    if nogo and not silent:
-        sendEmail('overlapping %s'%component,'There are %s instances running. Tried for %d [s] \n%s'%(len(process_check),
-                                                                                                      polled,
-                                                                                                      '\n'.join(process_check)))
-        print "quitting because of overlapping processes"
-
-    return nogo
+        #self.all_locks()
+        # remove the lock doc
+        self.clean( component = self.component,
+                    pid = self.pid,
+                    host = self.host)
 
 def userLock(component=None):
     if not component:
@@ -1249,6 +1639,75 @@ def genericGet( base, url, load=True, headers=None):
     else:
         result = r2.read()
     return result
+
+class ThreadHandler(threading.Thread):
+    def __init__(self, **args):
+        threading.Thread.__init__(self)
+        self.threads = args.get('threads', [])
+        self.n_threads = args.get('n_threads', 10)
+        self.r_threads = []
+        self.sleepy = args.get('sleepy',10)
+        self.timeout = args.get('timeout',None)
+        self.verbose = args.get('verbose',False)
+        self.label = args.get('label', 'ThreadHandler')
+
+    def run(self):
+        self._run()
+        self.threads = self.r_threads
+
+    def _run(self):
+        random.shuffle(self.threads)
+        ntotal=len(self.threads)
+        print "Processing",ntotal,"threads with",self.n_threads,"max concurrent and timeout",self.timeout,'[min]'
+        start_now = time.mktime(time.gmtime())
+        self.r_threads = []
+        
+
+        bug_every=max(len(self.threads) / 10., 100.) ## 10 steps of eta verbosity
+        next_ping = int(len(self.threads)/bug_every)
+        while self.threads:
+            if self.timeout and (time.mktime(time.gmtime()) - start_now) > (self.timeout*60.):
+                print '[%s]'%self.label,"Stopping to start threads because the time out is over",time.asctime(time.gmtime())
+                for t in self.r_threads:
+                    while t.is_alive():
+                        time.sleep(5)
+                ## transfer all to running
+                while self.threads:
+                    self.r_threads.append( self.threads.pop(-1))
+                ## then we have to kill all threads
+                for t in self.r_threads:
+                    pass
+                return
+
+                
+            running = sum([t.is_alive() for t in self.r_threads])
+            if self.n_threads==None or running < self.n_threads:
+                startme = self.n_threads-running if self.n_threads else len(self.threads)
+                if self.verbose or int(len(self.threads)/bug_every)<next_ping:
+                    next_ping =int(len(self.threads)/bug_every)
+                    now= time.mktime(time.gmtime())
+                    spend = (now - start_now)
+                    n_done = ntotal-len(self.threads)
+                    print '[%s]'%self.label,"Starting",startme,"new threads",len(self.threads),"remaining", time.asctime()
+                    if n_done:
+                        eta = (spend / n_done) * len(self.threads)
+                        print "Will finish in ~%.2f [s]"%(eta)
+                if startme > self.n_threads/5.:
+                    self.sleepy/=2.
+                for it in range(startme):
+                    if self.threads:
+                        self.r_threads.append( self.threads.pop(-1))
+                        self.r_threads[-1].start()
+                        ## just wait a sec
+                        time.sleep(5)
+            time.sleep(self.sleepy)
+        ##then wait for completion
+        while sum([t.is_alive() for t in self.r_threads]):
+            if self.timeout and (time.mktime(time.gmtime()) - start_now) > (self.timeout*60.):
+                print '[%s]'%self.label,"Stopping to wait for threads because the time out is over",time.asctime(time.gmtime())
+                return
+            time.sleep(self.sleepy)
+        
 
 
 
@@ -1449,7 +1908,8 @@ class docCache:
                 'timestamp' : time.mktime( time.gmtime()),
                 'expiration' : default_expiration(),
                 #'getter' : lambda : json.loads( os.popen('curl -s --retry 5 https://test-cmstransfererrors.web.cern.ch/test-CMSTransferErrors/stuck_%s.json'%cat).read()),
-                'getter' : lambda : json.loads( os.popen('curl -s --retry 5 https://cms-stucktransfers.web.cern.ch/cms-stucktransfers/stuck_%s.json'%cat).read()),
+                #'getter' : lambda : json.loads( os.popen('curl -s --retry 5 https://cms-stucktransfers.web.cern.ch/cms-stucktransfers/stuck_%s.json'%cat).read()),
+                'getter' : lambda : json.loads( os.popen('curl -s --retry 5 http://snarayan.web.cern.ch/snarayan/TransferErrors/stuck_%s.json'%cat).read()),
                 'cachefile' : None,
                 'default' : {}
                 }
@@ -1545,6 +2005,16 @@ class docCache:
                     return copy.deepcopy(cache['default'])
 
 def getNodes(url, kind):
+    tries = 5 
+    while tries>0:
+        tries-=1
+        try:
+            return _getNodes(url, kind)
+        except Exception as e:
+            pass
+    print str(e)
+
+def _getNodes(url, kind):
     conn = make_x509_conn(url)
     #conn  =  httplib.HTTPSConnection(url, cert_file = os.getenv('X509_USER_PROXY'), key_file = os.getenv('X509_USER_PROXY'))
     r1=conn.request("GET",'/phedex/datasvc/json/prod/nodes')
@@ -1693,13 +2163,6 @@ class siteInfo:
 
             self.sites_banned = UC.get('sites_banned')
 
-            try:
-                sites_full = json.loads(open('sites_full.json').read())
-                ### ban or not things that have a lot more upcoming than normal
-                ## self.sites_banned.extend ( sites_full )
-            except:
-                pass
-
             #data = dataCache.get('ssb_158') ## 158 is the site readyness metric
             data = dataCache.get('ssb_237') ## 237 is the site readyness metric
 
@@ -1719,16 +2182,21 @@ class siteInfo:
                 else:
                     self.sites_not_ready.append( siteInfo['VOName'] )
 
-            ##hack
+            ##over-ride those since they are only handled through jobrouting
             add_as_ready = [
                 'T3_US_OSG',
+                'T3_US_Colorado',
                 'T3_CH_CERN_HelixNebula',
                 'T3_CH_CERN_HelixNebula_REHA',
-                'T3_US_NERSC'
+                'T3_US_NERSC',
+                'T3_US_TACC',
+                'T3_US_PSC'
                             ]
             for aar in add_as_ready:
-                self.sites_ready.append(aar)
-                self.all_sites.append(aar)
+                if not aar in self.sites_ready:
+                    self.sites_ready.append(aar)
+                if not aar in self.all_sites:
+                    self.all_sites.append(aar)
 
 
 
@@ -1754,13 +2222,19 @@ class siteInfo:
         self.sites_T0s_all = [ s for s in self.all_sites if s.startswith('T0_')]
 
         self.sites_AAA = list(set(self.sites_ready) - set(['T2_CH_CERN_HLT']))
+        ## good enough to read lightweight
         add_on_aaa = ['T3_CH_CERN_HelixNebula',
                       'T3_CH_CERN_HelixNebula_REHA',
                       
+                      
         ]
+        ## good enough to do premixing
         add_on_good_aaa = ['T3_IN_TIFRCloud',
                            'T3_US_NERSC',
+                           'T3_US_PSC',
+                           'T3_US_TACC',
                            'T3_US_OSG',
+                           'T3_US_Colorado'
         ]
         add_on_aaa = list(set(add_on_good_aaa + add_on_aaa))
         self.sites_AAA = list(set(self.sites_AAA + add_on_aaa ))
@@ -1809,7 +2283,10 @@ class siteInfo:
             'T2_CH_CERN_T0': 'T2_CH_CERN',
             'T2_CH_CERN_AI' : 'T2_CH_CERN',
             'T3_US_NERSC' : 'T1_US_FNAL_Disk',
+            'T3_US_TACC' : 'T1_US_FNAL_Disk',
+            'T3_US_PSC' : 'T1_US_FNAL_Disk',
             'T3_US_OSG' : 'T1_US_FNAL_Disk',
+            'T3_US_Colorado' : 'T1_US_FNAL_Disk',
             'T3_CH_CERN_HelixNebula' : 'T2_CH_CERN',
             'T3_CH_CERN_HelixNebula_REHA' : 'T2_CH_CERN'
             }
@@ -2226,6 +2703,76 @@ class siteInfo:
         #return r_weights.keys()[self._weighted_choice_sub(r_weights.values())]
         return self._pick(sites, self.cpu_pledges)
 
+class remainingDatasetInfo:
+    def __init__(self):
+        self.client = mongo_client()
+        self.db = self.client.unified.remainingDatasetInfo
+    
+    def clean(self):
+        existings = self.db.find()
+        for o in existings:
+            self.db.delete_one({'_id' :o['_id']})
+ 
+    def sync(self, site=None):
+        if not site:
+            print "synching with all site possible"
+            sites = []
+            try:
+                r = json.loads(eosRead('%s/remaining.json'%( monitor_dir)))
+                sites = r.keys()
+            except:
+                try:
+                    for fn in filter(None,os.popen('ls -1 %s/remaining_*.json | sort '%monitor_dir).read().split('\n')):
+                        site = fn.split('_',1)[-1].split('.')[0]
+                        if not any([site.endswith(v) for v in ['_MSS','_Export']]):
+                            sites.append( site )
+                except:
+                    pass
+            for site in sites:
+                self.sync( site )
+        else:
+            print "synching on site",site
+            remaining_reasons = json.loads(eosRead('%s/remaining_%s.json'%(monitor_dir,site)))
+            self.set(site, remaining_reasons)
+
+    def set(self, site, info):
+        if not info: return
+        existings = [o['dataset'] for o in self.db.find({'site' : site})]
+        updatings = info.keys()
+        n = time.gmtime()
+        now = time.mktime( n )
+        nows = time.asctime( n )
+        ## drop existing datasets that are not to be updated
+        for dataset in sorted(set(existings) - set(updatings)):
+            self.db.delete_one({'site' : site, 'dataset' : dataset})
+        for dataset,dinfo in info.items():
+            content = { 'site' : site,
+                        'dataset' : dataset,
+                        'reasons' : dinfo.get('reasons',[]),
+                        'size' : dinfo.get('size',0),
+                        'time' : now,
+                        'date' : nows
+                    }
+            self.db.update_one({'site' : site, 'dataset' : dataset},
+                               {"$set": content},
+                               upsert = True)
+
+    def sites(self):
+        r_sites = sorted(set([r['site'] for r in self.db.find() ]))
+        return r_sites
+
+    def get(self, site):
+        existings = self.db.find({'site' : site})
+        r = {}
+        for o in existings:
+            r[o['dataset']] = { 'size' : o.get('size',0),
+                                'reasons' : o.get('reasons',[])}
+        return r
+
+    def tell(self, site):
+        info = self.get(site)
+        print json.dumps(info, indent=2)
+
 def isHEPCloudReady(url, limit=20):
     conn = make_x509_conn(url)
     #conn  =  httplib.HTTPSConnection(url, cert_file = os.getenv('X509_USER_PROXY'), key_file = os.getenv('X509_USER_PROXY'))
@@ -2250,14 +2797,43 @@ global_SI.instance = None
 class closeoutInfo:
     def __init__(self):
         self.owner = "%s-%s"%( socket.gethostname(), os.getpid())
-        try:
-            ## this needs to get in a db so as to be concurrent
-            self.record = json.loads(open('%s/closedout.json'%base_eos_dir).read())
-        except:
-            print "No closed-out record, starting fresh"
-            self.record = {}
-
         self.removed_keys = set()
+        self.client = mongo_client()
+        self.db = self.client.unified.closeoutInfo
+        self.record = {}
+        #print len([o for o in self.db.find()])
+
+        ### one time sync
+        #olddb = json.loads(eosRead('/eos/cms/store/unified/closedout.json'))
+        #for k,v in olddb.items():
+        #    self.update(k,v)
+
+    def pop(self, wfn):
+        if wfn in self.record:
+            self.record.pop(wfn)
+        self.removed_keys.add( wfn )
+        while self.db.find_one({'name' : wfn}):
+            self.db.delete_one({'name' : wfn})
+
+    def update(self, wfn ,record):
+        put_record = self.db.find_one({'name' : wfn})
+        if not put_record: put_record={}
+        put_record.update( record )
+        self.db.update_one( {'name' : wfn},
+                            {"$set": put_record},
+                            upsert = True)
+        self.record[wfn] = put_record
+        
+    def get(self, wfn):
+        if not wfn in self.record:
+            record = self.db.find_one({'name' : wfn})
+            if record:
+                record.pop('name')
+                record.pop('_id')
+                self.record[wfn] = record
+            else:
+                return None
+        return self.record[wfn]
 
     def table_header(self):
         text = '<table border=1><thead><tr><th>workflow</th><th>OutputDataSet</th><th>%Compl</th><th>acdc</th><th>Dupl</th><th>LSsize</th><th>Scubscr</th><th>dbsF</th><th>dbsIF</th><th>\
@@ -2268,6 +2844,7 @@ phdF</th><th>Updated</th><th>Priority</th></tr></thead>'
         if count%2:            color='lightblue'
         else:            color='white'
         text=""
+        _ = self.get( wf ) ## cache the value
         tpid = self.record[wf]['prepid']
         pid = tpid.replace('task_','')
 
@@ -2338,20 +2915,21 @@ phdF</th><th>Updated</th><th>Priority</th></tr></thead>'
     def summary(self):
 
 
-        html = open('%s/closeout.html'%monitor_dir,'w')
+        #html = open('%s/closeout.html'%monitor_dir,'w')
+        html = eosFile('%s/closeout.html'%monitor_dir,'w')
         html.write('<html>')
         html.write('Last update on %s(CET), %s(GMT), <a href=logs/checkor/ target=_blank> logs</a> <br><br>'%(time.asctime(time.localtime()),time.asctime(time.gmtime())))
 
         html.write( self.table_header() )
 
         from assignSession import session, Workflow
-        for (count,wf) in enumerate(sorted(self.record.keys())):
+        #for (count,wf) in enumerate(sorted(self.record.keys())):
+        for (count,wf) in enumerate(sorted([o['name'] for o in self.db.find()])):
             wfo = session.query(Workflow).filter(Workflow.name == wf).first()
             if not wfo: continue
             if not (wfo.status == 'away' or wfo.status.startswith('assistance')):
                 print "Taking",wf,"out of the close-out record"
-                self.record.pop(wf)
-                self.removed_keys.add( wf )
+                self.pop( wf )
                 continue
             html.write( self.one_line( wf, wfo , count) )
 
@@ -2359,10 +2937,12 @@ phdF</th><th>Updated</th><th>Priority</th></tr></thead>'
         html.write('<br>'*100) ## so that the anchor works ok
         html.write('bottom of page</html>')
 
-        self.save()
+        html.close() ## and copy to eos
+        #self.save()
 
     def save(self):
-
+        return
+        ## all the rest is useless with pymongo
         ## gather all existing content
         while True:
             existings = glob.glob('%s/closedout.*.lock'%base_eos_dir)
@@ -2425,8 +3005,10 @@ phdF</th><th>Updated</th><th>Priority</th></tr></thead>'
         from assignSession import session, Workflow
         wfs = session.query(Workflow).filter(Workflow.status.startswith('assistance')).all()
 
-        short_html = open('%s/assistance_summary.html'%monitor_dir,'w')
-        html = open('%s/assistance.html'%monitor_dir,'w')
+        #short_html = open('%s/assistance_summary.html'%monitor_dir,'w')
+        #html = open('%s/assistance.html'%monitor_dir,'w')
+        short_html = eosFile('%s/assistance_summary.html'%monitor_dir,'w')
+        html = eosFile('%s/assistance.html'%monitor_dir,'w')
         html.write("""
 <html>
 <head>
@@ -2464,7 +3046,7 @@ Updated on %s (GMT) <br>
 <li> <b>biglumi</b> : the maximum size of the lumisection in one of the output has been exceeded <font color=red>(Operator)</font></li>
 <li> <b>bigoutput</b> : the maximum size for an output dataset to go to tape was exceeded (<font color=blue>Requester</font>/<font color=red>Operator)</font></li>
 <li> <b>filemismatch</b> : there is a mismatch in the number of files in DBS and Phedex <font color=red>(Operator)</font></li>
-<li> <b>duplicates</b> : duplicated lumisection have been found and need to be invalidated <font color=red>(Operator)</font></li>
+<li> <b>duplicates</b> : duplicated lumisection have been found and need to be invalidated <font color=green>(Automatic)</font></li>
 <li> <b>manual</b> : no automatic recovery was possible <font color=red>(Operator)</font></li>
 <li> <b>on-hold</b> : there was a notification made that a decision needs to be taken to move forward. Check the JIRA for details <font color=blue>(Requester</font>/<font color=red>Operator)</font></li>
 </ul><br>
@@ -2501,7 +3083,7 @@ Updated on %s (GMT) <br>
             short_lines = []
             prio_ordered_wf = []
             for (count,wfo) in enumerate(assist[status]):
-                if not wfo.name in self.record:
+                if not self.get( wfo.name ):
                     continue
                 prio = self.record[wfo.name]['priority']
                 prio_ordered_wf.append( (prio, wfo) )
@@ -2546,9 +3128,9 @@ Updated on %s (GMT) <br>
         html.write("<br>"*100)
         html.write("bottom of page</html>")
 
-
-
-
+        # close and put on eos
+        html.close()
+        short_html.close()
 
 
 def checkTransferApproval(url, phedexid):
@@ -2954,6 +3536,16 @@ def getDatasetFileLocations(url, dataset):
 
 
 def getDatasetFiles(url, dataset ,without_invalid=True ):
+    tries = 5 
+    while tries>0:
+        tries-=1
+        try:
+            return _getDatasetFiles(url, dataset ,without_invalid)
+        except Exception as e:
+            pass
+    print str(e)
+
+def _getDatasetFiles(url, dataset ,without_invalid=True ):
     dbsapi = DbsApi(url=dbs_url)
     files = dbsapi.listFileArray( dataset= dataset,validFileOnly=without_invalid, detail=True)
     dbs_filenames = [f['logical_file_name'] for f in files]
@@ -3400,6 +3992,16 @@ def getDatasetDestinations( url, dataset, only_blocks=None, group=None, vetoes=N
             raise Exception("getDatasetDestinations crashed")
 
 def getDatasetOnGoingDeletion( url, dataset ):
+    tries = 5 
+    while tries>0:
+        tries-=1
+        try:
+            return _getDatasetOnGoingDeletion(url, dataset)
+        except Exception as e:
+            pass
+    print str(e)
+
+def _getDatasetOnGoingDeletion( url, dataset ):
     conn = make_x509_conn(url)
     #conn  =  httplib.HTTPSConnection(url, cert_file = os.getenv('X509_USER_PROXY'), key_file = os.getenv('X509_USER_PROXY'))
     r1=conn.request("GET",'/phedex/datasvc/json/prod/deletions?dataset=%s&complete=n'%(dataset))
@@ -3492,6 +4094,14 @@ def try_getDatasetBlockAndSite( url, dataset, group=None,vetoes=None,complete=No
             if vetoes and any([veto in replica['node'] for veto in vetoes]): continue
             blocks_at_sites[replica['node']].add( item['name'] )
     #return dict([(site,list(blocks)) for site,blocks in blocks_at_sites.items()])
+    
+    #protect prune
+    for s in blocks_at_sites:
+        pbs = [ b for b in blocks_at_sites[s] if b.startswith(dataset)]
+        if len(pbs) != len(blocks_at_sites[s]):
+            sendEmail('getDatasetBlockAndSite','phedex is acting up %s %s'%(dataset, sorted(blocks_at_sites[s])), destination=['bmaier@mit.edu','natasha@fnal.gov','Dmytro.Kovalskyi@cern.ch'])
+        blocks_at_sites[s] = set(pbs)
+
     return dict(blocks_at_sites)
 
 def getDatasetPresence( url, dataset, complete='y', only_blocks=None, group=None, vetoes=None, within_sites=None):
@@ -3600,7 +4210,24 @@ def getDatasetBlocksFromFiles( dataset, files):
             collected_blocks.add( fn['block_name'] )
     return sorted(collected_blocks)
 
+def tcWrapper( *argv, **args):
+    label = argv[0]
+    func = argv[1]
+    argv = argv[1:]
+
 def getDatasetBlockSize(dataset):
+    count=5
+    label = "getDatasetBlockSize"
+    while count>0:
+        try:
+            return _getDatasetBlockSize(dataset)
+        except Exception as e:
+            print "[%d] Failed on %s with \n%s"%(count,label,str(e))
+            time.sleep(5)
+    raise Exception("Failed on %s with \n%s"%( label,str(e)))
+
+
+def _getDatasetBlockSize(dataset):
     dbsapi = DbsApi(url=dbs_url)
     blocks = dbsapi.listBlockSummaries( dataset = dataset, detail=True)
     return dict([(block['block_name'],block['file_size']/ (1024.**3)) for block in blocks ])
@@ -4212,7 +4839,7 @@ def setFileStatus(file_names, validate=True):
             dbswrite.updateFileStatus( logical_file_name= fn['logical_file_name'], is_file_valid = int(validate) )
 
 
-def setDatasetStatus(dataset, status):
+def setDatasetStatus(dataset, status, withFiles=True):
     dbswrite = DbsApi(url=dbs_url_writer)
 
     new_status = getDatasetStatus( dataset )
@@ -4221,10 +4848,19 @@ def setDatasetStatus(dataset, status):
         print "setting dataset status",status,"to inexistant dataset",dataset,"considered succeeding"
         return True
 
+    file_status = -1
+    if status in ['DELETED', 'DEPRECATED', 'INVALID']:
+        file_status = 0
+    else:
+        file_status = 1
     max_try=3
     while new_status != status:
         dbswrite.updateDatasetType(dataset = dataset, dataset_access_type= status)
         new_status = getDatasetStatus( dataset )
+        if withFiles and file_status!=-1:
+            files = dbswrite.listFiles(dataset=dataset)
+            for this_file in files:
+                dbswrite.updateFileStatus(logical_file_name=this_file['logical_file_name'], is_file_valid=file_status)
         max_try-=1
         if max_try<0: return False
     return True
@@ -4240,6 +4876,17 @@ def getDatasetStatus(dataset):
             return None
 
 def getDatasets(dataset):
+    count=5
+    label = "getDatasets"
+    while count>0:
+        try:
+            return _getDatasets(dataset)
+        except Exception as e:
+            print "[%d] Failed on %s with \n%s"%(count,label,str(e))
+            time.sleep(5)
+    raise Exception("Failed on %s with \n%s"%( label,str(e)))
+    
+def _getDatasets(dataset):
     # initialize API to DBS3
     dbsapi = DbsApi(url=dbs_url)
     # retrieve dataset summary
@@ -4630,6 +5277,16 @@ def display_time( sec ):
     return dis
 
 def getWorkflowByMCPileup( url, dataset , details=False):
+    retries=5
+    while retries>0:
+        retries-=1
+        try:
+            return _getWorkflowByMCPileup(url, dataset , details)
+        except Exception as e:
+            pass
+    print str(e)
+    
+def _getWorkflowByMCPileup( url, dataset , details=False):
     conn = make_x509_conn(url)
     #conn  =  httplib.HTTPSConnection(url, cert_file = os.getenv('X509_USER_PROXY'), key_file = os.getenv('X509_USER_PROXY'))
     there = '/couchdb/reqmgr_workload_cache/_design/ReqMgr/_view/bymcpileup?key="%s"'%(dataset)
@@ -4660,6 +5317,19 @@ def getWorkflowById( url, pid , details=False):
         return [item['id'] for item in items]
 
 
+def invalidate(url, wfi, only_resub=False, with_output=True):
+    import reqMgrClient
+    familly = wfi.getFamilly( and_self=True, only_resub=only_resub)
+    outs = set()
+    check = []
+    for fwl in familly:
+        check.append(reqMgrClient.invalidateWorkflow(url, fwl['RequestName'], current_status=fwl['RequestStatus'], cascade=False))
+        outs.update( fwl['OutputDatasets'] )
+    if with_output:
+        for dataset in outs:
+            check.append(setDatasetStatus(dataset, 'INVALID'))
+    check = [r in ['None',None,True] for r in check]
+    return check
 
 def forceComplete(url, wfi):
     import reqMgrClient
@@ -4678,6 +5348,15 @@ def forceComplete(url, wfi):
             print "rejecting",member['RequestName']
             reqMgrClient.invalidateWorkflow(url, member['RequestName'], current_status=member['RequestStatus'])
 
+def agentInfoDB():
+    client = mongo_client()
+    return client.unified.agentInfo
+
+def agent_speed_draining(db=None):
+    if db is None:
+        db = agentInfoDB()
+    return set([a['name'] for a in db.find() if a.get('speeddrain',False)])
+
 class agentInfo:
     def __init__(self, **args):
         self.url = args.get('url')
@@ -4689,26 +5368,54 @@ class agentInfo:
         self.max_pending_cpus = args.get('max_pending_cpus', 10000000)
         self.wake_up_draining = args.get('wake_up_draining', False)
         ## keep some info in a local file
-        try:
-            self.info = json.loads(open('%s/agent_info.json'%base_eos_dir).read())
-        except:
-            self.info = {}
-
+        self.db = agentInfoDB()
+        self.all_agents = [a['name'] for a in self.db.find()]
+        #print "got from pymongo",self.all_agents
         self.buckets = defaultdict(list)
+        self.drained = set()
         self.wake_draining = False ## do not wake up agents that are on drain already
         self.release = defaultdict(set)
         self.m_release = defaultdict(set)
         self.ready = self.getStatus()
         if not self.ready:
             print "AgentInfo could not initialize properly"
-            #print "ARAKIRI : AgentInfo could not initialize properly"
-            #sys.exit(1)
+        #print json.dumps(self.buckets, indent=2)
+        print json.dumps(self.content(), indent=2)
+
+    def content(self):
+        ## same as 
+        r= {}
+        for a in self.db.find():
+            a.pop('_id')
+            an = a.pop('name')
+            r[an] = a
+        return r
+
+    def speed_draining(self):
+        return agent_speed_draining(self.db)
+        
+    def _getA(self, agent):
+        a = self.db.find_one({'name' : agent})
+        return a if a else {}
+
+    def _get(self, agent, field, default=None):
+        return self._getA(agent).get(field, default)
+
+    def _update(self, agent, info):
+        ## works for inserting
+        put_info = self._getA(agent)
+        put_info.update( info )
+        put_info['name'] = agent
+        self.db.update_one( {'name': agent},
+                            {"$set": put_info},
+                            upsert = True)
 
     def agentStatus(self, agent):
-        for status in self.buckets:
-            if agent in self.buckets[status]:
-                return status
-        return 'N/A'
+        return self._get(agent, 'status', 'N/A')
+        #for status in self.buckets:
+        #    if agent in self.buckets[status]:
+        #        return status
+        #return 'N/A'
 
     def checkTrello(self, sync_trello=None, sync_agents=None, acting=False):
         from TrelloClient import TrelloClient
@@ -4718,15 +5425,17 @@ class agentInfo:
 
         now,nows = self.getNow()
 
-        for agent in self.info:
+        for agent in self.all_agents:
             #print "checking on",agent
+            astatus = self._get(agent,'status')
             ti = tc.getCard( cn = agent)
-            lid = tc.lists.get(self.info[agent].get('status'))
-            #print agent,lid,self.info[agent].get('status'),tc.lists
+            lid = tc.lists.get( astatus )
+            #print agent,lid,astatus,tc.lists
             lid_name = tc.getList(ln=lid).get('name')
             clid = ti.get('idList',None)
             if lid and clid and lid!=clid:
                 print "there is a mismatch for agent",agent
+                print "sync_trello",sync_trello,"sync_agents",sync_agents
                 if sync_trello==True or (sync_trello and agent in sync_trello):
                     print "changing",agent,"into list",lid,lid_name
                     if acting:
@@ -4748,15 +5457,25 @@ class agentInfo:
                         ## should set the agent in standby
                         do_drain = True
                         new_status = 'standby'
+                    elif clid == tc.lists.get('drained'):
+                        do_drain = True
+                        new_status = 'offline'
+                    elif clid == tc.lists.get('offline'):
+                        do_drain = True
+                        new_status = 'offline'
+                    else:
+                        print "trello status",clid,"not recognized"
+                        continue
+
                     ## operate the agent
                     print "wish to operate",agent,do_drain,new_status
                     if acting:
                         setAgentDrain(self.url, agent, drain=do_drain)
                         ## change the local information
-                        self.info[agent].update( {'status' : new_status,
-                                                  'update' : now,
-                                                  'date' : nows }
-                                                 )
+                        self._update(agent, {'status' : new_status,
+                                             'update' : now,
+                                             'date' : nows }
+                                     )
 
             #print agent,lid,clid
 
@@ -4769,22 +5488,34 @@ class agentInfo:
             print "cannot get production agent information"
             return False
         prod_info = dict([(a['agent_url'].split(':')[0], a) for a in all_agents_prod])
-        all_agents_name = sorted(set(self.info.keys() + prod_info.keys()))
+        all_agents_name = sorted(set(self.all_agents + prod_info.keys()))
         ## do you want to use this to make an alarm on agent in error for too long ?
         self.in_error = [a['agent_url'].split(':')[0] for a in all_agents_prod if a.get('down_components',[])]
         print "agents with errors",self.in_error
 
         now,nows = self.getNow()
-
+        def drained( stats ):
+            upload = stats.get('upload_status',{})
+            condor = stats.get('condor_status',{})
+            ## match 
+            # {u'upload_status': {u'dbs_notuploaded': 0, u'dbs_open_blocks': 0, u'phedex_notuploaded': 0}, u'workflows_completed': True, u'condor_status': {u'idle': 0, u'running': 0}}
+            if upload.get('dbs_notuploaded',1) == 0 and upload.get('dbs_open_blocks',1)==0 and upload.get('phedex_notuploaded',1)==0 and condor.get('idle',1)==0 and condor.get('running',1)==0:
+                return True
+            return False
         for agent in all_agents_name:
-            linfo = self.info.get( agent, {})
+            linfo = self._getA(agent)
             pinfo = prod_info.get( agent, {})
             p_release = linfo.get('version',None)
             release = pinfo.get('agent_version',None)
+            #is_drained = drained( pinfo.get('drain_stats',{}) )
+            is_drained = False
+                
             if self.verbose:
                 print agent
                 print linfo
                 print pinfo
+                print "drained",is_drained
+
             if release:
                 self.release[ release ].add( str(agent) )
             if linfo:
@@ -4800,10 +5531,13 @@ class agentInfo:
                             st = 'standby'
                         else:
                             st = 'draining'
+                            if is_drained:
+                                self.drained.add( agent )
+                            
                 else:
                     ## and is gone from production
                     st = 'offline'
-                self.info[agent]['status'] = st
+                self._update(agent, {'status': st})
             else:
                 ## the agent is new here. let's assume it is in standby if in drain
                 st = 'running'
@@ -4814,15 +5548,18 @@ class agentInfo:
                     print "A new agent in the pool",agent,"setting",st
 
                 ## add it
-                self.info[agent] = { 'status' : st,
+                self._update(agent, {'status' : st,
                                      'update' : now,
                                      'date' : nows }
+                         )
                 if self.verbose:
-                    print self.info[agent]
-            self.info[agent].setdefault('version', release)
+                    print self._getA(agent)
 
-        for a,i in self.info.items():
-            self.buckets[i['status']].append( a )
+            if release:
+                self._update(agent, {'version': release})
+
+        for a in self.all_agents:
+            self.buckets[self._get(a, 'status')].append( a )
 
         if not self.buckets.get('standby',[]):
             msg = "There are no agent in standby!!"
@@ -4834,9 +5571,6 @@ class agentInfo:
 
         return True
 
-    def __del__(self):
-        open('%s/agent_info.json'%base_eos_dir,'w').write( json.dumps( self.info, indent=2))
-
     def getNow(self):
         now = time.gmtime()
         nows = time.asctime( now )
@@ -4845,15 +5579,18 @@ class agentInfo:
 
     def change_status(self, agent, st):
         now,nows = self.getNow()
-        self.info[agent]['status'] = st
-        self.info[agent]['update'] = now
-        self.info[agent]['date'] = nows
+        self._update(agent, { 'status' : st,
+                              'update': now,
+                              'date' : nows
+                          })
 
     def flag_standby(self, agent):
-        if self.info.get(agent,{}).get('status',None) == 'draining':
+        if self._getA(agent).get('status',None) == 'draining':
             if self.verbose:
                 print "Able to set",agent,"in standby"
             self.change_status( agent, 'standby')
+        else:
+            print "not changing status from",self._getA(agent).get('status',None)
 
     def poll(self, wake_up_draining=False, acting=False, verbose=False):
         if not self.ready:
@@ -4895,30 +5632,33 @@ class agentInfo:
         last_action_timeout = 5 *60*60 # hours
         last_action_static = 20*60*60 # hours
         for agent in self.buckets.get('running',[]):
-            if (now-self.info[agent]['update'])<(last_action_timeout):
+            agent_update = self._get(agent, 'update')
+            if (now-agent_update)<(last_action_timeout):
                 one_recent_running = True
-                timeout_for_running = last_action_timeout - (now-self.info[agent]['update'])
+                timeout_for_running = last_action_timeout - (now-agent_update)
                 if timeout_last_running == None or timeout_last_running < timeout_for_running:
                     timeout_last_running = timeout_for_running
-            if (now-self.info[agent]['update'])<(last_action_static):
+            if (now-agent_update)<(last_action_static):
                 recent_running.add(agent )
 
         for agent in self.buckets.get('standby',[]):
-            if (now-self.info[agent]['update'])<(last_action_timeout):
+            agent_update = self._get(agent, 'update')
+            if (now-agent_update)<(last_action_timeout):
                 one_recent_standby = True
-                timeout_for_standby = last_action_timeout - (now-self.info[agent]['update'])
+                timeout_for_standby = last_action_timeout - (now-agent_update)
                 if timeout_last_standby == None or timeout_last_standby < timeout_for_standby:
                     timeout_last_standby = timeout_for_standby
-            if (now-self.info[agent]['update'])<(last_action_static):
+            if (now-agent_update)<(last_action_static):
                 recent_standby.add(agent )
 
         for agent in self.buckets.get('draining',[]):
-            if (now-self.info[agent]['update'])<(last_action_timeout):
+            agent_update = self._get(agent, 'update')
+            if (now-agent_update)<(last_action_timeout):
                 one_recent_draining = True
-                timeout_for_draining = last_action_timeout - (now-self.info[agent]['update'])
+                timeout_for_draining = last_action_timeout - (now-agent_update)
                 if timeout_last_draining == None or timeout_last_draining < timeout_for_draining:
                     timeout_last_draining = timeout_for_draining
-            if (now-self.info[agent]['update'])<(last_action_static):
+            if (now-agent_update)<(last_action_static):
                 recent_draining.add( agent )
 
         timeout_action = max([timeout_last_running,timeout_last_standby,timeout_last_draining])
@@ -4963,7 +5703,7 @@ class agentInfo:
         for agent,ainfo in all_agents.items():
             if not 'Name' in ainfo: continue
             agent_name = ainfo['Name']
-            if not agent_name in self.info: continue
+            if not agent_name in self.all_agents: continue
             r = ainfo['TotalRunningJobs']
             cr = ainfo['TotalRunningCpus']
             t = ainfo['MaxJobsRunning']
@@ -4981,7 +5721,7 @@ class agentInfo:
         for agent,ainfo in all_agents.items():
             if not 'Name' in ainfo: continue
             agent_name = ainfo['Name']
-            if not agent_name in self.info: continue
+            if not agent_name in self.all_agents: continue
             r = ainfo['TotalRunningJobs']
             cr = ainfo['TotalRunningCpus']
             t = ainfo['MaxJobsRunning']
@@ -5002,7 +5742,7 @@ class agentInfo:
                     speed_draining.add( agent_name )
                 if len(standbies)<=1 and (r+p <= self.open_draining_threshold):
                     open_draining.add( agent_name )
-                if r==0 and p==0:
+                if r==0 and p==0 and agent_name in self.drained:
                     fully_empty.add( agent_name )
 
             if agent_name in standbies:
@@ -5035,7 +5775,7 @@ class agentInfo:
                     candidates_to_drain.add( agent_name )
 
         candidates_to_drain = candidates_to_drain - recent_running
-        candidates_to_wakeup = candidates_to_wakeup - recent_draining -recent_standby
+        candidates_to_wakeup = candidates_to_wakeup - recent_draining -recent_standby - set(self.in_error)
         candidates_to_standby = candidates_to_standby - recent_running
 
 
@@ -5057,7 +5797,7 @@ class agentInfo:
             print "These are candidates for draining",sorted(candidates_to_drain)
             print "These are good for speed drainig",sorted(speed_draining)
             print "These are good for open draining",sorted(open_draining)
-
+            print "These are fully empty",sorted(fully_empty)
         if not acting:
             speed_draining = set()
             open_draining = set()
@@ -5129,9 +5869,7 @@ class agentInfo:
                     msg = "putting agent %s in production"% wake_up
                     sendLog('agentInfo', msg, level='critical')
                     manipulated_agents.add( wake_up )
-                    self.info[wake_up] = { 'status' : 'running',
-                                           'update' : now,
-                                           'date' : nows }
+                    self.change_status(wake_up, 'running')
         elif drain_agent:
             ## pick one agent to drain
             sleep_up = None
@@ -5142,9 +5880,7 @@ class agentInfo:
                     msg = "putting agent %s in drain mode"% sleep_up
                     sendLog('agentInfo', msg, level='critical')
                     manipulated_agents.add( sleep_up )
-                    self.info[sleep_up] = { 'status' : 'draining',
-                                            'update' : now,
-                                            'date' : nows }
+                    self.change_status(sleep_up, 'draining')
             else:
                 print "Agents need to be set in drain, but nothing is there to be drained"
 
@@ -5161,9 +5897,7 @@ class agentInfo:
                 msg = "putting agent %s in drain mode for retiring"% sleep_up
                 sendLog('agentInfo', msg, level='critical')
                 manipulated_agents.add( sleep_up )
-                self.info[sleep_up] = { 'status' : 'standby',
-                                        'update' : now,
-                                        'date' : nows }
+                self.change_status(sleep_up, 'standby')
         else:
             if not acting:
                 print "The polling is not proactive"
@@ -5174,7 +5908,7 @@ class agentInfo:
             ## set the config tweaks to enable retry=0 and thresold=0
             pass
 
-        already_speed_drain = set(json.loads(open('%s/speed_draining.json'%base_eos_dir).read()))
+        already_speed_drain = self.speed_draining()
         all_in_priority_drain = set()
         if (already_speed_drain & speed_draining):
             ## lets keep that agent in speed drainig
@@ -5187,12 +5921,17 @@ class agentInfo:
             all_in_priority_drain.update( speed_draining[:1] )
 
         all_in_priority_drain.update( open_draining )
-        open('%s/speed_draining.json'%base_eos_dir,'w').write(json.dumps( list(all_in_priority_drain) ))
+        ## operate this
+        for agent in self.all_agents:
+            self._update(agent, {'speeddrain' : agent in all_in_priority_drain})
 
         if fully_empty:
             msg = 'These agents are fully empty %s and ready for redeploy'% sorted(fully_empty)
-            sendLog('agentInfo',msg, level='critical')
-            #sendEmail('agentInfo', msg, destination=['alan.malta@cern.ch']) ## can be removed at some point
+            #sendLog('agentInfo',msg, level='critical')
+            ## manipulate them into the "drained" list
+            for agent in fully_empty:
+                self._update(agent, {'status': 'drained'})
+                manipulated_agents.add( agent )
 
         ## should update trello with the agents that got manipulated at this time
         self.checkTrello(sync_trello=list(manipulated_agents), acting=acting)
@@ -5437,6 +6176,94 @@ def checkIfBlockIsAtASite(url,block,site):
 
     return False
 
+class wtcInfo:
+    def __init__(self):
+        self.client = mongo_client()
+        self.db = self.client.unified.wtcInfo
+
+    def add(self, action, keyword, user=None):
+        ##add an item for the action (hold, bypass, force) for the keyword
+        if not keyword:
+            print "blank keyword is not allowed"
+            return
+        n = time.gmtime()
+        now = time.mktime( n )
+        nows = time.asctime( n )
+        document= {
+            'user' : user if user else os.environ.get('USER',None),
+            'keyword' : keyword,
+            'action' : action,
+            'time' : now,
+            'date' : nows}
+        self.db.update_one( {'keyword' : keyword},
+                            {"$set": document},
+                            upsert = True
+                        )
+    def sync(self):
+
+        force = getForceCompletes()
+        for user,items in force.items():
+            for item in items:
+                print user, item
+                self.add( action='force', keyword=item, user = user)
+                
+
+        UC = unifiedConfiguration()
+        actors = UC.get('allowed_bypass')
+        
+        for bypassor,email in actors:
+            bypass_file = '/afs/cern.ch/user/%s/%s/public/ops/bypass.json'%(bypassor[0],bypassor)
+            if not os.path.isfile(bypass_file):
+                continue
+            try:
+                print "Can read bypass from", bypassor
+                extending = json.loads(open(bypass_file).read())
+                print bypassor,"is bypassing",json.dumps(sorted(extending))
+                for ex in extending:
+                    self.add( action = 'bypass' , keyword = ex, user = bypassor)
+            except:
+                pass
+        
+            holding_file = '/afs/cern.ch/user/%s/%s/public/ops/onhold.json'%(bypassor[0],bypassor)
+            if not os.path.isfile(holding_file):
+                continue
+            try:
+                extending = json.loads(open(holding_file).read())
+                print bypassor,"is holding",json.dumps(sorted(extending))
+                for ex in extending:
+                    self.add( action = 'hold' , keyword = ex, user = bypassor)
+            except:
+                pass
+
+    def _get(self, action):
+        r= defaultdict(list)
+        for i in self.db.find({'action' : action}):
+            r[i['user']].append(i['keyword'])
+        return dict(r)
+        
+    def getHold(self):
+        return self._get('hold')
+    def getBypass(self):
+        return self._get('bypass')
+    def getForce(self):
+        return self._get('force')
+
+    def clean(self):
+        wfns = []
+        for s in ['announced','normal-archived','rejected','aborted','aborted-archived','rejected-archived']:
+            wfns.extend( getWorkflows( reqmgr_url , s))
+        for item in self.db.find():
+            key = item['keyword']
+            if any([key in wfn for wfn in wfns]):
+                print item.get('keyword'),"can go"
+                self.db.delete_one({'_id' : item.get('_id',None)})
+            
+    def remove(self, keyword):
+        ## will remove from the db anything that the item matches on
+        for item in self.db.find():
+            if item.get('keyword',None) in keyword:
+                print item,"goes away"
+                self.db.delete_one({'_id' : item.get('_id',None)})
 
 def getForceCompletes():
     overrides = {}
@@ -5485,7 +6312,6 @@ class workflowInfo:
                     raise Exception("Failed to get workload cache for %s"%workflow)
         else:
             self.request = copy.deepcopy( request )
-
         self.full_spec=None
         if spec:
             self.get_spec()
@@ -5509,20 +6335,24 @@ class workflowInfo:
 
 
 
-    def getFamiolly(self, details=True, and_self=False):
-        return self.getFamilly(details, and_self)
+    #def getFamiolly(self, details=True, and_self=False):
+    #    return self.getFamilly(details, and_self)
 
-    def getFamilly(self, details=True, and_self=False):
+    def getFamilly(self, details=True, only_resub=False, and_self=False):
         familly = getWorkflowById( self.url, self.request['PrepID'] ,details=True)
         true_familly = []
         for member in familly:
+            acdc = member['RequestType']=='Resubmission'
+            myself = member['RequestName'] == self.request['RequestName']
             if member['RequestDate'] < self.request['RequestDate']: continue
             if member['RequestStatus'] in ['None',None]: continue
-            if member['RequestName'] == self.request['RequestName'] and not and_self: continue
-            if details:
-                true_familly.append( member )
-            else:
-                true_familly.append( member['RequestName'] )
+            
+            if (myself and and_self) or (only_resub and acdc and not myself) or (not only_resub and not myself): 
+                if details:
+                    true_familly.append( member )
+                else:
+                    true_familly.append( member['RequestName'] )
+
         return true_familly
 
     def checkSettings(self):
@@ -5555,8 +6385,9 @@ class workflowInfo:
         #single_tiers = (len(all_tiers) == len(set(all_tiers)))
         single_tiers = True
         ## more than one task with output until https://github.com/dmwm/WMCore/issues/8269 gets solved
-        output_per_task = self.getOutputPerTask()
-        output_from_single_task = len(output_per_task.keys())==1
+        #output_per_task = self.getOutputPerTask()
+        #output_from_single_task = len(output_per_task.keys())==1
+        output_from_single_task = True ## the parentage 
         ## more than one task to not convert single task in a step
         #more_than_one_task = wfi.request.get('TaskChain',0)>1
         more_than_one_task = True
@@ -5629,6 +6460,17 @@ class workflowInfo:
             sendLog(sub, text, wfi = self, show=False, level='workflow')
 
     def get_spec(self):
+        try:
+            return self._get_spec()
+        except:
+            time.sleep(1)
+            try:
+                return self._get_spec()
+            except Exception as e:
+                print "cannot get spec for",self.request['RequestName']
+                return None
+
+    def _get_spec(self):
         if not self.full_spec:
             self.conn = make_x509_conn(self.url)
             r1=self.conn.request("GET",'/couchdb/reqmgr_workload_cache/%s/spec'%self.request['RequestName'])
@@ -5744,6 +6586,21 @@ class workflowInfo:
         return self.dashb
 
     def getWMStats(self ,cache=0):
+        trials = 10
+        while trials>0:
+            try:
+                return self._getWMStats(cache=cache)
+            except Exception as e:
+                print "Failed",trials,"at reading getWMStats"
+                print str(e)
+                print self.request['RequestName']
+                self.conn = make_x509_conn(self.url)
+
+            trials-=1
+            time.sleep(1)
+        return None
+
+    def _getWMStats(self ,cache=0):
         f_cache = '%s/%s.wmstats'%(cache_dir, self.request['RequestName'])
         if cache:
             if os.path.isfile(f_cache):
@@ -5843,8 +6700,8 @@ class workflowInfo:
         missing_to_run_at = defaultdict(lambda : defaultdict(int))
         original_whitelist = self.request['SiteWhitelist']
         for doc in self.recovery_doc:
-            #print task
             task = doc['fileset_name']
+            #print task,doc['files'].keys()
             for f,info in doc['files'].iteritems():
                 missing_to_run[task] += info['events']
                 if f.startswith('MCFakeFile'):
@@ -5862,19 +6719,27 @@ class workflowInfo:
         agents = self.getActiveAgents()
         agents = map(lambda s : s.split('/')[-1].split(':')[0], agents)
         wf = self.request['RequestName']
+        inagent=None
         for agent in agents:
             if 'fnal' in agent: continue
             src = '%s:/data/srv/wmagent/current/install/wmagent/WorkQueueManager/cache/%s/WMSandbox/%s/cmsRun1/pileupconf.json'%(agent, wf, task)
             dest = '/tmp/%s-%s.json'%( wf, task)
             if os.path.isfile( dest ) and False:
+                inagent=agent
                 res = json.loads(open( dest ).read())
                 break
             print agent
             com = 'scp %s %s'%( src, dest)
             os.system( com )
             if os.path.isfile( dest ):
+                inagent=agent
                 res = json.loads(open( dest ).read())
                 break
+        if inagent:
+            print "found PU json in:",inagent
+        else:
+            print "PU json not found"
+                
         return res
 
     def getClassicalPUOverflow(self, task):
@@ -5910,21 +6775,19 @@ class workflowInfo:
 
     def getWorkQueue(self):
         if not self.workqueue:
-            try:
-                r1=self.conn.request("GET",'/couchdb/workqueue/_design/WorkQueue/_view/elementsByParent?key="%s"&include_docs=true'% self.request['RequestName'])
-                r2=self.conn.getresponse()
-            except:
+            TT = 0
+            while TT<5:
+                TT+=1
                 try:
-                    time.sleep(1) ## time-out
                     r1=self.conn.request("GET",'/couchdb/workqueue/_design/WorkQueue/_view/elementsByParent?key="%s"&include_docs=true'% self.request['RequestName'])
                     r2=self.conn.getresponse()
-                except:
+                    self.workqueue = list([d['doc'] for d in json.loads(r2.read())['rows']])
+                except Exception as e:
                     self.conn = make_x509_conn(self.url)
-                    #self.conn  =  httplib.HTTPSConnection(self.url, cert_file = os.getenv('X509_USER_PROXY'), key_file = os.getenv('X509_USER_PROXY'))
-                    print "failed to get work queue for",self.request['RequestName']
+                    time.sleep(1) ## time-out
+                    print "Failed to get workqueue"
+                    print str(e)
                     self.workqueue = []
-                    return self.workqueue
-            self.workqueue = list([d['doc'] for d in json.loads(r2.read())['rows']])
         return self.workqueue
 
 
@@ -6247,16 +7110,11 @@ class workflowInfo:
             else:
                 sites_allowed = sorted(set(SI.sites_T0s + SI.sites_T1s + SI.sites_with_goodAAA))
         elif primary:
-            sites_allowed =sorted(set(SI.sites_T0s + SI.sites_T1s + SI.sites_T2s + SI.sites_T3s))
+            sites_allowed =sorted(set(SI.sites_T0s + SI.sites_T1s + SI.sites_T2s))# + SI.sites_T3s))
         else:
             # no input at all
             ## all site should contribute
-            sites_allowed =sorted(set( SI.sites_T0s + SI.sites_T2s + SI.sites_T1s + SI.sites_T3s ))
-            ### hack if we have urgency to kick gen-sim away
-            #ust2s = set([site for site in SI.sites_T2s if site.startswith('T2_US')])
-            #allmcores = set(SI.sites_mcore_ready)
-            #sites_allowed =list(set( SI.sites_T2s ) - ust2s) ## remove all US
-            #sites_allowed = list(set( SI.sites_T2s ) - allmcores) ## remove all multicore ready
+            sites_allowed =sorted(set( SI.sites_T0s + SI.sites_T2s + SI.sites_T1s))# + SI.sites_T3s ))
         if pickone:
             sites_allowed = sorted([SI.pick_CE( sites_allowed )])
 
@@ -6322,8 +7180,8 @@ class workflowInfo:
         hold = False
         ## for those that are modified, add it and return it
         modified_splits = []
-        GB_space_limit = unifiedConfiguration().get('GB_space_limit')
-        GB_space_limit *= ncores
+        config_GB_space_limit = unifiedConfiguration().get('GB_space_limit')
+        GB_space_limit = config_GB_space_limit*ncores
         output_size_correction = unifiedConfiguration().get('output_size_correction')
 
         if self.request['RequestType']=='StepChain':
@@ -6363,6 +7221,15 @@ class workflowInfo:
                 task = spl['splitParams']
                 tname = spl['taskName'].split('/')[-1]
                 t = find_task_dict( tname )
+                ncores = t.get('Multicore', ncores)
+                GB_space_limit = config_GB_space_limit ## not multiplied by ncores
+                if t.get('KeepOutput',True) == False:
+                    ## we can shoot the limit up, as we don't care too much.
+                    #GB_space_limit = 10000 * ncores
+                    print "the output is not kept, but keeping the output size to",GB_space_limit
+
+                #print tname,ncores
+                #print GB_space_limit
                 sizeperevent = t.get('SizePerEvent',None)
                 for keyword,factor in output_size_correction.items():
                     if keyword in spl['taskName']:
@@ -6420,6 +7287,11 @@ class workflowInfo:
                                                                                                                                                 GB_space_limit,
                                                                                                                                                 events_per_lumi_at_this_task,
                                                                                                                                                 this_max_events_per_lumi)
+			    sendLog('assignor', "The output size task %s is expected to be too large : %.2f GB > %f GB even for one lumi (effective lumi size is ~%d), should go as low as %d"% ( tname ,
+                                                                                                                                                size_per_input_lumi / (1024.**2 ),
+                                                                                                                                                GB_space_limit,
+                                                                                                                                                events_per_lumi_at_this_task,
+                                                                                                                                                this_max_events_per_lumi), level='critical')
                             max_events_per_lumi.append( this_max_events_per_lumi/efficiency_factor ) ## adding this to that later on we can check and adpat the split 0
                         elif (avg_events_per_job * sizeperevent ) > (GB_space_limit*1024.**2):
                             ## should still change the avg_events_per_job setting of that task
@@ -6428,132 +7300,35 @@ class workflowInfo:
                                                                                                                                                          avg_events_per_job * sizeperevent / (1024.**2 ),
                                                                                                                                                          GB_space_limit,
                                                                                                                                                          this_max_events_per_lumi)
-
+			    sendLog('assignor', 'The output size of task %s is expected to be too large : %d x %.2f kB = %.2f GB > %f GB. Should set as low as %d'%( tname ,
+                                                                                                                                                         avg_events_per_job, sizeperevent,
+                                                                                                                                                         avg_events_per_job * sizeperevent / (1024.**2 ),
+                                                                                                                                                         GB_space_limit,
+                                                                                                                                                         this_max_events_per_lumi), level='critical')
                             modified_split_for_task = spl
                             modified_split_for_task['splitParams']['events_per_job'] = this_max_events_per_lumi
                             modified_splits.append( modified_split_for_task )
+                            max_events_per_lumi.append( this_max_events_per_lumi/efficiency_factor ) ## adding this to that later on we can check and adpat the split 0
 
             if max_events_per_lumi:
                 if events_per_lumi_inputs:
                     if min(max_events_per_lumi)<events_per_lumi_inputs:
                         ## there was an input dataset somewhere and we cannot break down that lumis, except by changing to EventBased
-                        print "the smallest value of %s is still smaller than %s evt/lumi of the input"%(max_events_per_lumi, events_per_lumi_inputs)
+                        print "the smallest value of %s is still smaller than %s evt/lumi of the input dataset"%(max_events_per_lumi, events_per_lumi_inputs)
+			sendLog('assignor', 'the smallest value of %s is still smaller than %s evt/lumi of the input dataset'%(max_events_per_lumi, events_per_lumi_inputs), level='critical')
                         hold = True
                     else:
-                        hold = True #to be removed
+                        #hold = True #to be removed
                         print "the smallest value of %s is ok compared to %s evt/lumi in the input"%(max_events_per_lumi, events_per_lumi_inputs)
                 else:
                     root_split = splits[0]
-                    root_split['splitParams']['events_per_lumi'] = min(max_events_per_lumi)
-                    modified_splits.append( root_split )
+                    current_split = root_split.get('splitParams',{}).get('events_per_lumi',None)
+                    if current_split and current_split > min(max_events_per_lumi):
+                        root_split['splitParams']['events_per_lumi'] = min(max_events_per_lumi)
+                        modified_splits.append( root_split )
 
         ## the return list can easily be used to call the splitting api of reqmgr2
         return hold,modified_splits
-
-
-    def checkWorkflowSplitting( self ):
-        answer = True
-        answer_d = {}
-        if self.request['RequestType']=='TaskChain':
-            (min_child_job_per_event, root_job_per_event, max_blow_up) = self.getBlowupFactors()
-            if min_child_job_per_event and max_blow_up>2.:
-                print min_child_job_per_event,"should be the best non exploding split"
-                print "to be set instead of",root_job_per_event
-                setting_to = min_child_job_per_event*1.5
-                print "using",setting_to
-                print "Not setting anything yet, just informing about this"
-                answer=True
-                #answer_d.update({'EventsPerJob': setting_to })
-
-            ##check on events/lumi if relevant
-            splits = self.getSplittings()
-            events_per_lumi=None
-            max_events_per_lumi=None
-            def find_task_dict( name ):
-                i_task=1
-                while True:
-                    tname = 'Task%d'%i_task
-                    i_task+=1
-                    if not tname in self.request: break
-                    if self.request[tname]['TaskName'] == name:
-                        return copy.deepcopy( self.request[tname] )
-                return None
-            for task in splits:
-                #print "the task split",task
-                if 'events_per_lumi' in task:
-                    events_per_lumi = task['events_per_lumi']
-
-
-                ## avg_events_per_job is base on 8h. we could probably put some margin
-                elif events_per_lumi and 'avg_events_per_job' in task:
-                    avg_events_per_job = (task['avg_events_per_job'] *2 )
-                    tname = task['splittingTask'].split('/')[-1]
-                    t = find_task_dict( tname )
-
-                    sizeperevent = t.get('SizePerEvent',None)
-                    ## climb up all task to take the filter eff into account
-                    while t and 'InputTask' in t:
-                        t = find_task_dict( t['InputTask'] )
-                        if 'FilterEfficiency' in t:
-                            avg_events_per_job /= t['FilterEfficiency']
-                    if (events_per_lumi > avg_events_per_job):
-                        print "The default splitting will not work for subsequent steps",events_per_lumi,">",avg_events_per_job
-                        if max_events_per_lumi==None or (max_events_per_lumi < avg_events_per_job):
-                            max_events_per_lumi = avg_events_per_job
-
-                    GB_space_limit = 25.
-                    if sizeperevent and (avg_events_per_job * sizeperevent ) > (GB_space_limit*1024.**2):
-                        print "The output size of task %s is expected to be too large : %d x %.2f kB = %.2f GB > %f GB "% ( tname ,
-                                                                                                                           avg_events_per_job, sizeperevent,
-                                                                                                                           avg_events_per_job * sizeperevent / (1024.**2 ),
-                                                                                                                           GB_space_limit)
-                        if (events_per_lumi * sizeperevent ) > (GB_space_limit*1024.**2):
-                            ## derive a value for the lumisection
-                            max_events_per_lumi =int( (GB_space_limit*1024.**2 /2.) / sizeperevent)
-                            print "The output size task %s is expected to be too large : %.2f GB > %f GB even for one lumi %d, should do %d"% ( tname ,
-                                                                                                                                                events_per_lumi * sizeperevent / (1024.**2 ),
-                                                                                                                                                GB_space_limit,
-                                                                                                                                                events_per_lumi,
-                                                                                                                                                max_events_per_lumi)
-                        else:
-                            ## should still change the avg_events_per_job setting of that task
-                            avg_events_per_job_for_task = int( (GB_space_limit*1024.**2 /2.) / sizeperevent)
-                            print "it will actually be OK for one lumisection, but task %s should be set with %d events per job in average"%( tname, avg_events_per_job_for_task)
-
-
-
-
-
-            if max_events_per_lumi:
-                print "the base splitting should be changed to", max_events_per_lumi,"per lumi"
-                answer_d.update({'EventsPerLumi' : max_events_per_lumi})
-
-            return answer_d if answer_d else answer
-
-
-        ## this isn't functioning for taskchain BTW
-        if 'InputDataset' in self.request:
-            average = getDatasetEventsPerLumi(self.request['InputDataset'])
-            timing = self.request['TimePerEvent']
-
-            ## need to divide by the number of cores in the job
-            ###average /= ncores
-            ## if we can stay within 48 with one lumi. do it
-            timeout = 48 *60.*60. #self.request['OpenRunningTimeout']
-            if (average * timing) < timeout:
-                ## we are within overboard with one lumi only
-                # we should set max_events_per_lumi in the request to prevent it from blowing up too in creation failures
-                return True
-
-            spl = self.getSplittings()[0]
-            algo = spl['splittingAlgo']
-            if algo == 'EventAwareLumiBased':
-                events_per_job = spl['avg_events_per_job']
-                if average > events_per_job:
-                    ## need to do something
-                    print "This is going to fail",average,"in and requiring",events_per_job
-                    return {'SplittingAlgorithm': 'EventBased'}
-        return True
 
 
     def getFilterEfficiency( self, taskName ):
@@ -6675,16 +7450,25 @@ class workflowInfo:
     def getOutputPerTask(self):
         all_outputs = self.request['OutputDatasets']
         output_per_task = defaultdict(list)
+        if 'ChainParentageMap' in self.request:
+            for t,info in self.request['ChainParentageMap'].items():
+                for dsname in info.get('ChildDsets'):
+                    output_per_task[t].append( dsname)
+            return dict(output_per_task)
         for t in self.getWorkTasks():
+            #print t._internal_name
             #print "what",t.subscriptions
             parse_what = t.subscriptions.outputModules if hasattr(t.subscriptions,'outputModules') else t.subscriptions.outputSubs
-            for om in parse_what:
-                dsname = getattr(t.subscriptions, om).dataset
-                if dsname in all_outputs: ## do the intersection with real outputs
-                    #print dsname
-                    #print t._internal_name
-                    output_per_task[t._internal_name].append( dsname )
-
+            if parse_what:
+                for om in parse_what:
+                    dsname = getattr(t.subscriptions, om).dataset
+                    if dsname in all_outputs: ## do the intersection with real outputs
+                        #print dsname
+                        #print t._internal_name
+                        output_per_task[t._internal_name].append( dsname )
+            else:
+                print "no output subscriptions..."
+                
         return dict(output_per_task)
 
     def getAllTasks(self, select=None):
@@ -6704,7 +7488,7 @@ class workflowInfo:
         for spl in result:
             if not spl['taskType'] in ['Production','Processing','Skim'] : continue
             if strip:
-                for drop in ['algorithm','trustPUSitelists','trustSitelists','deterministicPileup','type','include_parents','lheInputFiles','runWhitelist','runBlacklist','collectionName','group','couchDB','couchURL','owner','initial_lfn_counter','filesetName']:
+                for drop in ['algorithm','trustPUSitelists','trustSitelists','deterministicPileup','type','include_parents','lheInputFiles','runWhitelist','runBlacklist','collectionName','group','couchDB','couchURL','owner','initial_lfn_counter','filesetName', 'runs','lumis']:
                     if drop in spl['splitParams']:
                         spl['splitParams'].pop(drop)
             splittings.append( spl )
@@ -7044,6 +7828,7 @@ class workflowInfo:
                     continue
                 while True:
                     predicted = '/'.join(['',dsn,'-'.join([aera,aps,'v%d'%(version+1)]),tier])
+                    print "checking against",predicted
                     conflicts = getWorkflowByOutput( self.url, predicted )
                     conflicts = filter(lambda wfn : wfn!=self.request['RequestName'], conflicts)
                     if len(conflicts):

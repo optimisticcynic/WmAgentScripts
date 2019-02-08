@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-from utils import workflowInfo, siteInfo, monitor_dir, monitor_pub_dir, base_dir, global_SI, getDatasetPresence, getDatasetBlocksFraction, getDatasetBlocks, unifiedConfiguration, getDatasetEventsPerLumi, dataCache, unified_url, base_eos_dir, monitor_eos_dir, unified_url_eos
+from utils import workflowInfo, siteInfo, monitor_dir, monitor_pub_dir, base_dir, global_SI, getDatasetPresence, getDatasetBlocksFraction, getDatasetBlocks, unifiedConfiguration, getDatasetEventsPerLumi, dataCache, unified_url, base_eos_dir, monitor_eos_dir, unified_url_eos, eosFile, ThreadHandler, moduleLock
 import time
 
 import json
@@ -47,17 +47,18 @@ class AgentBuster(threading.Thread):
 class ReadBuster(threading.Thread):
     def __init__(self, **args):
         threading.Thread.__init__(self)
-        self.deamon = True
+        self.daemon = True
         for k,v in args.items():
             setattr(self,k,v)
 
     def run(self):
         self.readable = os.system('XRD_REQUESTTIMEOUT=10 xrdfs root://cms-xrd-global.cern.ch stat %s'%self.file)
+        
 
 class XRDBuster(threading.Thread):
     def __init__(self, **args):
         threading.Thread.__init__(self)
-        self.deamon = True
+        self.daemon = True
         for k,v in args.items():
             setattr(self,k,v)
 
@@ -120,72 +121,6 @@ class XRDBuster(threading.Thread):
                                         print "no file retrieved in",local
 
 
-class ThreadHandler(threading.Thread):
-    def __init__(self, **args):
-        threading.Thread.__init__(self)
-        self.threads = args.get('threads', 10)
-        self.n_threads = args.get('n_threads', 10)
-        self.sleepy = args.get('sleepy',10)
-        self.timeout = args.get('timeout',None)
-        self.verbose = args.get('verbose',False)
-
-    def run(self):
-        random.shuffle(self.threads)
-        ntotal=len(self.threads)
-        print "Processing",ntotal,"threads with",self.n_threads,"max concurrent and timeout",self.timeout,'[min]'
-        start_now = time.mktime(time.gmtime())
-        r_threads = []
-        ## check all running threads and move them in r_threads
-        #for t in threads:
-        #    if t.is_alive():
-        #        r_threads.append( t )
-        #        threads.remove( t ) 
-        ## check all finished threads and move them in r_threads
-
-        bug_every=max(len(self.threads) / 10., 100.) ## 10 steps of eta verbosity
-        next_ping = int(len(self.threads)/bug_every)
-        while self.threads:
-            if self.timeout and (time.mktime(time.gmtime()) - start_now) > (self.timeout*60.):
-                print "Stopping to start threads because the time out is over",time.asctime(time.gmtime())
-                ## transfer all to running
-                while self.threads:
-                    r_threads.append( self.threads.pop(-1))
-                ## then we have to kill all threads
-                for t in r_threads:
-                    pass
-                ## and exit the loop
-                self.threads = r_threads
-                return
-
-                
-            running = sum([t.is_alive() for t in r_threads])
-            #if self.verbose: print running,"/",n_threads,"running threads"
-            if self.n_threads==None or running < self.n_threads:
-                startme = self.n_threads-running if self.n_threads else len(self.threads)
-                if self.verbose or int(len(self.threads)/bug_every)<next_ping:
-                    next_ping =int(len(self.threads)/bug_every)
-                    now= time.mktime(time.gmtime())
-                    spend = (now - start_now)
-                    n_done = ntotal-len(self.threads)
-                    print "Starting",startme,"new threads",len(self.threads),"remaining" 
-                    if n_done:
-                        eta = (spend / n_done) * len(self.threads)
-                        print "Will finish in ~%.2f [s]"%(eta)
-                if startme > self.n_threads/5.:
-                    self.sleepy/=2.
-                for it in range(startme):
-                    if self.threads:
-                        r_threads.append( self.threads.pop(-1))
-                        r_threads[-1].start()
-                        ## just wait a sec
-                        time.sleep(5)
-            time.sleep(self.sleepy)
-        ##then wait for completion
-        while sum([t.is_alive() for t in r_threads]):
-            time.sleep(1)
-        
-        ## and swap list back
-        self.threads = r_threads
 
 
 def parse_one(url, wfn, options=None):
@@ -273,6 +208,8 @@ def parse_one(url, wfn, options=None):
     
     if not 'AgentJobInfo' in stat:
         stat['AgentJobInfo'] = {}
+        print "no information in AgentJobInfo, they agents must have been retired. I cannot go on without creating a partial report"
+        return task_error_site_count, one_explanation 
         #print "bad countent ?"
         #print json.dumps(  stat,  indent=2)
 
@@ -337,7 +274,10 @@ def parse_one(url, wfn, options=None):
     r_type = wfi.request.get('OriginalRequestType', wfi.request.get('RequestType','NaT'))
     if r_type in ['ReReco']:
         html += '<a href=../datalumi/lumi.%s.html>Lumisection Summary</a>, '% wfi.request['PrepID']
-    html += '<a href="https://its.cern.ch/jira/issues/?jql=text~%s AND project = CMSCOMPPR" target="_blank">jira</a>'% (wfi.request['PrepID'])
+    html += '<a href="https://its.cern.ch/jira/issues/?jql=text~%s AND project = CMSCOMPPR" target="_blank">jira</a>,'% (wfi.request['PrepID'])
+    html += '<a href="https://vocms0113.cern.ch/seeworkflow/?workflow=%s">console</a>,'% wfn
+    html += '<a href="http://vocms0276.cern.ch/tasks?page=1&filter=%s">new console</a>,'% wfn
+    html += '<a href="http://wc-dev.cern.ch/tasks?page=1&filter=%s">dev console</a>'% wfn
     html+='<hr>'
     html += '<a href=#IO>I/O</a>, <a href=#ERROR>Errors</a>, <a href=#BLOCK>blocks</a>, <a href=#FILE>files</a>, <a href=#CODES>Error codes</a><br>'
     html+='<hr>'
@@ -705,16 +645,37 @@ def parse_one(url, wfn, options=None):
         html +='%s <b>@ %s</b><br>'%(block, ','.join(sorted(needed_blocks_loc[block])))
 
     html += '<a name=FILE></a>'
-    html += "<br><b>Files in no block</b><br>"
+    html += "<br><b>%s Files in no block</b><br>"%( len(files_and_loc_notin_dbs.keys()))
     rthreads = []
     check_files = [ f for f in files_and_loc_notin_dbs.keys() if '/store' in f]
     random.shuffle( check_files )
-    check_files = check_files[:100]
-    check_files = [] ## disable it completely
+    #check_files = check_files[:100]
+    check_files = []
     by_f = {}
+    f_locations = defaultdict(set)
     if check_files:
+        import dynamoClient
+        DC=dynamoClient.dynamoClient()
+        dirs_by_site = defaultdict(set)
         for f in check_files:
-            rthreads.append( ReadBuster( file = f))
+            dir,fn = f.rsplit('/',1)
+            for s in files_and_loc_notin_dbs[f]:
+                dirs_by_site[s].add( dir )
+        files_by_site = DC.files_in_dir( dirs_by_site )
+        #print dirs_by_site
+        #print files_by_site
+        
+        for f in check_files:
+            locs = [s for s in files_by_site if f in files_by_site[s] ]
+            if locs:
+                by_f[f] = True
+                f_locations[f].update( locs )
+            else:
+                by_f[f] = False
+
+        """
+        for f in check_files:
+            rthreads.append( ReadBuster( file = f ))
         print "checking on existence of",len(rthreads),"files"
         run_rthreads = ThreadHandler( threads = rthreads, n_threads = 20, timeout = 10)
         run_rthreads.start()
@@ -724,23 +685,58 @@ def parse_one(url, wfn, options=None):
         for t in run_rthreads.threads:
             by_f[t.file] = t.readable
             #print "checked",t.file,t.readable
-
-    for f in sorted(files_and_loc_notin_dbs.keys()):
+        """
+    files_html = ""
+    existing_html = ""
+    lost_html = ""
+    separate_h = False
+    missing_files = defaultdict(int)
+    expected_files = defaultdict(int)
+    max_number_of_files = 500 
+    display_files = sorted(files_and_loc_notin_dbs.keys())
+    display_files = display_files[:max_number_of_files] if max_number_of_files else display_files
+    
+    for f in display_files:
         readable = by_f.get(f,-1)
-        if readable == -1:
+        if readable == -1 or not 'store' in f:
             fs = '%s'%f
-        elif readable == 0:
-            fs = '<font color=light green>%s</font>'%f
-            #print f,"is readable"
+            sites_strs = sorted(files_and_loc_notin_dbs[f])
         else:
-            fs = '<font color=red>%s</font>'%f
-            #print f,"is not readable"
+            for s in files_and_loc_notin_dbs[f]:
+                expected_files[s]+=1
+            if readable == True:
+                fs = '<font color="light green">%s</font>'%f
+                #print f,"is readable"
+            else:
+                fs = '<font color=red>%s</font>'%f
+                #print f,"is not readable"
+                for s in files_and_loc_notin_dbs[f]:
+                    missing_files[s]+=1
+        
+            sites_strs = [ '<font color="%s">%s</font>'% ('light green' if s in f_locations[f] else 'red', s) for s in sorted(files_and_loc_notin_dbs[f])]
+            #seen_at = sorted(f_locations[f])
             
-        html +='%s <b>@</b> %s<br>'%(fs, ','.join(sorted(files_and_loc_notin_dbs[f])) )
-        #html +='%s <b>@</b> %s<br>'%(f , ','.join(sorted(files_and_loc_notin_dbs[f])) )
+        html_line ='%s <b>@</b> %s<br>'%( fs, 
+                                      ','.join( sites_strs ), 
+                                      #','.join(seen_at)
+                                  )
+        if not separate_h:
+            files_html += html_line
+        if readable == False:
+            lost_html += html_line
+        else:
+            existing_html += html_line
+    html += "<br><table border=1><thead><tr><td>Site</td><td>Expected files</td><td>Missing files</td></tr></thead>"
+    for s in sorted(expected_files.keys()):
+        if missing_files[s] or True:
+            html+="<tr bgcolor=%s><td>%s</td><td>%d</td><td>%d</td></tr>"%( "red" if missing_files[s] else "", s, expected_files[s], missing_files[s])
+    html += "</table><br>"
 
-
-
+    if separate_h:
+        html += existing_html
+        html += lost_html
+    else:
+        html += files_html
 
     html += '<hr><br>'
     html += '<a name=CODES></a>'
@@ -758,8 +754,10 @@ def parse_one(url, wfn, options=None):
     fn = '%s'% wfn
 
     time_point("error send to ES")
-    open('%s/report/%s'%(monitor_dir,fn),'w').write( html )
-    open('%s/report/%s'%(monitor_eos_dir,fn),'w').write( html )
+    #open('%s/report/%s'%(monitor_dir,fn),'w').write( html )
+    #open('%s/report/%s'%(monitor_eos_dir,fn),'w').write( html )
+    #eosFile('%s/report/%s'%(monitor_dir,fn),'w').write( html ).close()
+    eosFile('%s/report/%s'%(monitor_eos_dir,fn),'w').write( html ).close()
 
     time_point("Finished with showError")
 
@@ -769,7 +767,7 @@ def parse_one(url, wfn, options=None):
         ping+=1
         if ping%100:
             time_point("waiting for sub-threads to finish")
-        time.sleep(6)
+        time.sleep(30)
 
     time_point("Finished with retrieval threads")
 
@@ -887,7 +885,8 @@ def parse_top(url, options=None):
     print "found",len(all_bad_wfs),"to parse for detailled error report"
     parse_those(url, options, all_bad_wfs)
 
-    ht = open('%s/toperror.html'%monitor_eos_dir, 'w')
+    #ht = open('%s/toperror.html'%monitor_eos_dir, 'w')
+    ht = eosFile('%s/toperror.html'%monitor_eos_dir, 'w')
     ht.write("""<html>
 Report of workflows with top %s error in failure and cooloff<br>
 Last updated on %s (GMT)
@@ -965,11 +964,13 @@ def parse_those(url, options=None, those=[]):
         for code in one_explanation:
             explanations[code].update( one_explanation[code] )
 
-    open('%s/all_errors.json'%monitor_dir,'w').write( json.dumps(alls , indent=2 ))
+    #open('%s/all_errors.json'%monitor_dir,'w').write( json.dumps(alls , indent=2 ))
+    eosFile('%s/all_errors.json'%monitor_dir,'w').write( json.dumps(alls , indent=2 )).close()
 
     explanations = dict([(k,list(v)) for k,v in explanations.items()])
 
-    open('%s/explanations.json'%monitor_dir,'w').write( json.dumps(explanations, indent=2))
+    #open('%s/explanations.json'%monitor_dir,'w').write( json.dumps(explanations, indent=2))
+    eosFile('%s/explanations.json'%monitor_dir,'w').write( json.dumps(explanations, indent=2)).close()
 
     #alls = json.loads( open('all_errors.json').read())
 
@@ -1038,7 +1039,8 @@ class showError_options(object):
 if __name__=="__main__":
     url = 'cmsweb.cern.ch'
     
-    
+    mlock = moduleLock(component='showError', locking = False)
+    ml = mlock()
 
     UC = unifiedConfiguration()
     parser = optparse.OptionParser()

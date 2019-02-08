@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 from assignSession import *
-from utils import getWorkflows, workflowInfo, getDatasetEventsAndLumis, findCustodialLocation, getDatasetEventsPerLumi, siteInfo, getDatasetPresence, campaignInfo, getWorkflowById, forceComplete, makeReplicaRequest, getDatasetSize, getDatasetFiles, sendLog, reqmgr_url, dbs_url, dbs_url_writer, getForceCompletes, display_time
-from utils import componentInfo, unifiedConfiguration, userLock, duplicateLock, dataCache, unified_url, getDatasetLumisAndFiles, getDatasetRuns, duplicateAnalyzer, invalidateFiles, findParent, do_html_in_each_module
+from utils import getWorkflows, workflowInfo, getDatasetEventsAndLumis, findCustodialLocation, getDatasetEventsPerLumi, siteInfo, getDatasetPresence, campaignInfo, getWorkflowById, forceComplete, makeReplicaRequest, getDatasetSize, getDatasetFiles, sendLog, reqmgr_url, dbs_url, dbs_url_writer, display_time, checkMemory, ThreadHandler, wtcInfo
+from utils import componentInfo, unifiedConfiguration, userLock, moduleLock, dataCache, unified_url, getDatasetLumisAndFiles, getDatasetRuns, duplicateAnalyzer, invalidateFiles, findParent, do_html_in_each_module
 import phedexClient
 import dbs3Client
 dbs3Client.dbs3_url = dbs_url
@@ -16,28 +16,43 @@ import time
 import random
 import math
 from McMClient import McMClient
+from JIRAClient import JIRAClient
 from htmlor import htmlor
 from utils import sendEmail 
 from utils import closeoutInfo
 from showError import parse_one, showError_options
-#import csv 
+import threading
+import sys
+
+def get_campaign(output, wfi):
+    ## this should be a perfect matching of output->task->campaign
+    campaign = None
+    era = None
+    wf_campaign = None
+    if 'Campaign' in wfi.request:   wf_campaign = wfi.request['Campaign']
+    try:
+        era = output.split('/')[2].split('-')[0]
+    except:
+        era = None
+            
+    if wfi.isRelval(): 
+        campaign = wf_campaign
+    else:
+        campaign = era if era else wf_campaign
+    return campaign
 
 def checkor(url, spec=None, options=None):
     if userLock():   return
-    
-    ## the duplicate process lock was only necessary to prevent update clash on the closeoutinfo object.
-    ## fDB is concurrent resilient, so it can be removed
-    #wait = options.wait
-    #if options.go: wait=False
-    #if duplicateLock(wait=wait) and not options.go:  return
-    
+
+    mlock = moduleLock(locking=False)
+    ml=mlock()
+
     fDB = closeoutInfo()
 
     UC = unifiedConfiguration()
-    use_recoveror = UC.get('use_recoveror')
     
     use_mcm = True
-    up = componentInfo(mcm=use_mcm, soft=['mcm'])
+    up = componentInfo(soft=['mcm','wtc'])
     if not up.check(): return
     use_mcm = up.status['mcm']
 
@@ -95,74 +110,42 @@ def checkor(url, spec=None, options=None):
 
 
     custodials = defaultdict(list) #sites : dataset list
-    transfers = defaultdict(list) #sites : dataset list
+    #transfers = defaultdict(list) #sites : dataset list
     invalidations = [] #a list of files
     SI = siteInfo()
     CI = campaignInfo()
     mcm = McMClient(dev=False) if use_mcm else None
-
-    def get_campaign(output, wfi):
-        ## this should be a perfect matching of output->task->campaign
-        campaign = None
-        era = None
-        wf_campaign = None
-        if 'Campaign' in wfi.request:   wf_campaign = wfi.request['Campaign']
-        try:
-            era = output.split('/')[2].split('-')[0]
-        except:
-            era = None
-            
-        if wfi.isRelval(): 
-            campaign = wf_campaign
-        else:
-            campaign = era if era else wf_campaign
-        return campaign
+    JC = JIRAClient()
 
     ## retrieve bypass and onhold configuration
     bypasses = []
     forcings = []
-    overrides = getForceCompletes()
     holdings = []
 
-    
-    actors = UC.get('allowed_bypass')
-
-    for bypassor,email in actors:
-        bypass_file = '/afs/cern.ch/user/%s/%s/public/ops/bypass.json'%(bypassor[0],bypassor)
-        if not os.path.isfile(bypass_file):
-            #sendLog('checkor','no file %s',bypass_file)
+    WI = wtcInfo()
+    actors = [a for a,_ in UC.get('allowed_bypass')]
+    for user,extending in WI.getHold().items():
+        if not user in actors:
+            print user,"is not allowed to hold"
             continue
-        try:
-            print "Can read bypass from", bypassor
-            extending = json.loads(open(bypass_file).read())
-            print bypassor,"is bypassing",json.dumps(sorted(extending))
-            bypasses.extend( extending )
-        except:
-            sendLog('checkor',"cannot get by-passes from %s for %s"%(bypass_file ,bypassor))
-            sendEmail("malformated by-pass information","%s is not json readable"%(bypass_file), destination=[email])
-        
-        holding_file = '/afs/cern.ch/user/%s/%s/public/ops/onhold.json'%(bypassor[0],bypassor)
-        if not os.path.isfile(holding_file):
-            #sendLog('checkor',"no file %s"%holding_file)
+        print user,"is holding",extending
+        holdings.extend( extending )
+
+    for user,extending in WI.getBypass().items():
+        if not user in actors:
+            print user,"is not allowed to bypass"
             continue
-        try:
-            extending = json.loads(open(holding_file).read())
-            print bypassor,"is holding",json.dumps(sorted(extending))
-            holdings.extend( extending )
-        except:
-            sendLog('checkor',"cannot get holdings from %s for %s"%(holding_file, bypassor))
-            sendEmail("malformated by-pass information","%s is not json readable"%(holding_file), destination=[email])
-
-    unhold= ['fabozzi_Run2016B-v2-Tau-07Aug17_ver2_8029_170831_201310_7397']
-    for unh in unhold:
-        if unh in holdings:
-            holdings.remove(unh)
-
-    
-    for rider,extending in overrides.items():
-        print rider,"bypasses by forcecompleting",json.dumps(sorted(extending))
+        print user,"is bypassing",extending
         bypasses.extend( extending )
-
+        
+    overrides = {}
+    for user,extending in WI.getForce().items():
+        if not user in actors:
+            print user,"is not allowed to force complete"
+            continue
+        print user,"is force-completing",extending
+        bypasses.extend( extending )
+        overrides[user] = extending
 
     if use_mcm:
         ## this is a list of prepids that are good to complete
@@ -172,12 +155,12 @@ def checkor(url, spec=None, options=None):
     ## remove empty entries ...
     bypasses = filter(None, bypasses)
 
-    pattern_fraction_pass = UC.get('pattern_fraction_pass')
-    cumulative_fraction_pass = UC.get('cumulative_fraction_pass')
-    timeout_for_damping_fraction = UC.get('damping_fraction_pass')
-    damping_time = UC.get('damping_fraction_pass_rate')
-    damping_fraction_pass_max = float(UC.get('damping_fraction_pass_max')/ 100.)
-    acdc_rank_for_truncate = UC.get('acdc_rank_for_truncate')
+    #pattern_fraction_pass = UC.get('pattern_fraction_pass')
+    #cumulative_fraction_pass = UC.get('cumulative_fraction_pass')
+    #timeout_for_damping_fraction = UC.get('damping_fraction_pass')
+    #damping_time = UC.get('damping_fraction_pass_rate')
+    #damping_fraction_pass_max = float(UC.get('damping_fraction_pass_max')/ 100.)
+    #acdc_rank_for_truncate = UC.get('acdc_rank_for_truncate')
 
     random.shuffle( wfs )
 
@@ -186,7 +169,7 @@ def checkor(url, spec=None, options=None):
     ## now you have a record of what file was invalidated globally from TT
     TMDB_invalid = dataCache.get('file_invalidation') 
 
-
+    print "considering",len(wfs),"before any limitation"
     max_per_round = UC.get('max_per_round').get('checkor',None)
     if options.limit: 
         print "command line to limit to",options.limit
@@ -201,26 +184,234 @@ def checkor(url, spec=None, options=None):
         def rank( wfn ):
             return all_completed_plus.index( wfn ) if wfn in all_completed_plus else 0
         wfs = sorted( wfs, key = lambda wfo : rank( wfo.name ),reverse=True)
+        if options.update: random.shuffle( wfs )
         wfs = wfs[:max_per_round]
 
     total_running_time = 1.*60. 
-    sleep_time = 1
     will_do_that_many = len(wfs)
-    if len(wfs):
-        sleep_time = min(max(0.5, total_running_time / will_do_that_many), 10)
 
-    print len(wfs),"to consider, pausing for",sleep_time
     ## record all evolution
     full_picture = defaultdict(dict)
 
     report_created = 0
 
+    checkers = []
     for iwfo,wfo in enumerate(wfs):
+        ## do the check other one workflow
         if spec and not (spec in wfo.name): continue
+        checkers.append( CheckBuster(
+            will_do_that_many = will_do_that_many,
+            url = url,
+            wfo = wfo,
+            iwfo = iwfo,
+            bypasses = bypasses,
+            overrides = overrides,
+            holdings = holdings,
+            forcings = forcings,
+            exceptions = exceptions,
+            TMDB_invalid = TMDB_invalid,
+            UC = UC,
+            CI = CI,
+            SI = SI,
+            JC = JC,
+            use_mcm = use_mcm,
+            mcm = mcm
+            ))
+
+    ## run the threads
+    run_threads = ThreadHandler( threads = checkers,
+                                 n_threads = options.threads,
+                                 sleepy = 10,
+                                 timeout = None,
+                                 verbose = True,
+                                 label = 'checkor'
+                             )
+    run_threads.start()
+
+    ## waiting on all to complete
+    while run_threads.is_alive():
+        time.sleep(5)
+
+    print len(run_threads.threads),"finished thread to gather information from"
+
+    ## then wrap up from the threads
+    failed_threads = 0
+    for to in run_threads.threads:
+        if to.failed:
+            failed_threads += 1
+            continue
+        report_created += to.report_created
+        ## change status
+        if to.put_record:
+            fDB.update( to.wfo.name, to.put_record )
+
+        if to.to_status:
+            to.wfo.status = to.to_status
+            if 'manual' in to.to_status:
+                in_manual += 1
+            session.commit()
+            if to.to_status == 'close':
+                fDB.pop( wfo.name )
+                if use_mcm and to.force_by_mcm:
+                    for pid in to.pids:
+                        mcm.delete('/restapi/requests/forcecomplete/%s'%pid)
+
+        if to.custodials:
+            for site,items in to.custodials.items():
+                custodials[site].extend( items )
+
+    if failed_threads:
+        sendLog('checkor','%d threads have failed, better check this out'% failed_threads, level='critical')
+        ## remove once it's all good
+        sendEmail('checkor','%d threads have failed, better check this out'% failed_threads)
+
+    ## conclude things, the good old way
+    print report_created,"reports created in this run"
+
+    ## warn us if the process took a bit longer than usual
+    if wfs:
+        now = time.mktime(time.gmtime())
+        time_spend_per_workflow = float(now - time_point.start)/ float( float(len(wfs)))
+        print "Average time spend per workflow is", time_spend_per_workflow
+        ## set a threshold to it
+        if time_spend_per_workflow > 60:
+            sendLog('checkor','The module checkor took %.2f [s] per workflow'%( time_spend_per_workflow), level='critical')
+
+    if not spec and in_manual!=0:
+        some_details = ""
+        if options.strict:
+            some_details +="Workflows which just got in completed were looked at. Look in manual.\n"
+        if options.update:
+            some_details +="Workflows that are still running (and not completed) got looked at.\n"
+        if options.clear:
+            some_details +="Workflows that just need to close-out were verified. Nothing too new a-priori.\n"
+        if options.review:
+            some_details +="Workflows under intervention got review.\n"
+        count_statuses = defaultdict(int)
+        for wfo in session.query(Workflow).filter(Workflow.status.startswith('assistance')).all():
+            count_statuses[wfo.status]+=1
+        some_details +='\n'.join(['%3d in status %s'%( count_statuses[st], st ) for st in sorted(count_statuses.keys())])
+        #sendLog('checkor',"Fresh status are available at %s/assistance.html\n%s"%(unified_url, some_details))
+        #sendEmail("fresh assistance status available","Fresh status are available at %s/assistance.html\n%s"%(unified_url, some_details),destination=['katherine.rozo@cern.ch'])
+        pass
+
+    ## custodial requests
+    print "Custodials"
+    print json.dumps(custodials, indent=2)
+    for site in custodials:
+        items_at = defaultdict(set)
+        for i in custodials[site]:
+            item, group = i.split('@') if '@' in i else (i,'DataOps')
+            items_at[group].add( item )
+        for group,items in items_at.items():
+            print ','.join(items),'=>',site,'@',group
+            if not options.test:
+                result = makeReplicaRequest(url, site, sorted(items) ,"custodial copy at production close-out",custodial='y',priority='low', approve = (site in SI.sites_auto_approve) , group=group)
+                print result
+
+    print "File Invalidation"
+    print invalidations
+
+    ## a hook to halt checkor nicely at this stage
+    if os.path.isfile('.checkor_stop'):
+        print "The loop on workflows was shortened"
+        sendEmail('checkor','Checkor loop was shortened artificially using .checkor_stop')
+        os.system('rm -f .checkor_stop')
+
+
+            
+
+class CheckBuster(threading.Thread):
+    def __init__(self, **args):
+        threading.Thread.__init__(self)
+        ## a bunch of other things
+        for k,v in args.items():
+            setattr(self, k, v)
         
-        time.sleep( sleep_time )
+        ## actions
+        self.to_status = None
+        self.put_record = None
+        self.force_by_mcm = None
+        self.pids = None
+        self.report_created = 0 
+        self.custodials = defaultdict(list)
+        self.failed = False
+        ## need to find a way to redirect the printouts
+        #self.log_file = '%s/%s.checkout'%(cache_dir,self.wfo.name)
+
+    def run(self):
+        try:
+            #with open(self.log_file, 'w') as sys.stdout:
+            self.check()
+        except Exception as e:
+            #print "failed on", self.wfo.name
+            #print "due to"
+            #print str(e)
+            ## there should be a warning at this point
+            import traceback
+            sendLog('checkor','failed on %s due to %s and %s'%( self.wfo.name, str(e), traceback.format_exc()), level='critical')
+            self.failed = True
+
+    def check(self):
+
+        ## a hook to halt checkor nicely at this stage
+        if os.path.isfile('.checkor_stop'):
+            print "The check on workflows is shortened"
+            return
+
+        UC = self.UC
+        CI = self.CI            
+        SI = self.SI
+        JC = self.JC
+        url = self.url
+
+        bypasses = self.bypasses
+        overrides = self.overrides
+        holdings = self.holdings
+        forcings = self.forcings
+        exceptions = self.exceptions
+
+        TMDB_invalid = self.TMDB_invalid
+
+        use_mcm = self.use_mcm
+        mcm = self.mcm
+
+        will_do_that_many = self.will_do_that_many
+
+        wfo = self.wfo
+        iwfo = self.iwfo
+
+        pattern_fraction_pass = UC.get('pattern_fraction_pass')
+        cumulative_fraction_pass = UC.get('cumulative_fraction_pass')
+        timeout_for_damping_fraction = UC.get('damping_fraction_pass')
+        damping_time = UC.get('damping_fraction_pass_rate')
+        damping_fraction_pass_max = float(UC.get('damping_fraction_pass_max')/ 100.)
+        acdc_rank_for_truncate = UC.get('acdc_rank_for_truncate')
+        use_recoveror = UC.get('use_recoveror')
+
+        def time_point(label="",sub_lap=False, percent=None):
+            now = time.mktime(time.gmtime())
+            nows = time.asctime(time.gmtime())
+
+            print "[checkor] Time check (%s) point at : %s"%(label, nows)
+            if percent:
+                print "[checkor] finishing in about %.2f [s]" %( (now - time_point.start) / percent )
+            print "[checkor] Since start: %s [s]"% ( now - time_point.start)
+            if sub_lap:
+                print "[checkor] Sub Lap : %s [s]"% ( now - time_point.sub_lap ) 
+                time_point.sub_lap = now
+            else:
+                print "[checkor] Lap : %s [s]"% ( now - time_point.lap ) 
+                time_point.lap = now            
+                time_point.sub_lap = now
+
+        time_point.sub_lap = time_point.lap = time_point.start = time.mktime(time.gmtime())
         
+        now_s = time.mktime(time.gmtime())
+
         time_point("Starting checkor with %s Progress [%d/%d]"% (wfo.name, iwfo, will_do_that_many), percent = float(iwfo)/will_do_that_many)
+        usage = checkMemory()
+        print "memory so far",usage
 
         ## get info
         wfi = workflowInfo(url, wfo.name)
@@ -232,34 +423,30 @@ def checkor(url, spec=None, options=None):
         if wfo.wm_status == 'closed-out' and not wfo.name in exceptions:
             ## manually closed-out
             wfi.sendLog('checkor',"%s is already %s, setting close"%( wfo.name , wfo.wm_status))
-            wfo.status = 'close'
-            session.commit()
-            continue
+            self.to_status = 'close'
+            return
 
         elif wfo.wm_status in ['failed','aborted','aborted-archived','rejected','rejected-archived','aborted-completed']:
             ## went into trouble
             if wfi.isRelval():
                 wfi.sendLog('checkor',"%s is %s, but will not be set in trouble to find a replacement."%( wfo.name, wfo.wm_status))
-                wfo.status = 'forget'
+                self.to_status = 'forget'
             else:
-                wfo.status = 'trouble'
+                self.to_status = 'trouble'
                 wfi.sendLog('checkor',"%s is in trouble %s"%(wfo.name, wfo.wm_status))
-            session.commit()
-            continue
+            return 
         elif wfo.wm_status in ['assigned','acquired']:
             ## not worth checking yet
             wfi.sendLog('checkor',"%s is not running yet"%wfo.name)
-            session.commit()
-            continue
+            return
         
         if wfo.wm_status != 'completed' and not wfo.name in exceptions:
             ## for sure move on with closeout check if in completed
             wfi.sendLog('checkor',"no need to check on %s in status %s"%(wfo.name, wfo.wm_status))
-            session.commit()
-            continue
+            return
 
 
-        session.commit()        
+        #session.commit()        
         #sub_assistance="" # if that string is filled, there will be need for manual assistance
         existing_assistance_tags = set(wfo.status.split('-')[1:]) #[0] should be assistance
         assistance_tags = set()
@@ -276,6 +463,7 @@ def checkor(url, spec=None, options=None):
                 bypass_checks = True
                 break
         pids = wfi.getPrepIDs()
+        self.pids = pids
         force_by_mcm = False
         force_by_user = False
         for force in forcings:
@@ -293,33 +481,33 @@ def checkor(url, spec=None, options=None):
                     break
 
         delays = [ (now_s - completed_log[-1]['UpdateTime']) / (60.*60.*24.) if completed_log else 0 for completed_log in [filter(lambda change : change["Status"] in ["completed"], m['RequestTransition']) for m in wfi.getFamilly(details=True,and_self=True)]]
-        min_completed_delays = min(delays)
+        delays = filter(None, delays)
+        min_completed_delays = min(delays) ## take the shortest time since a member of the familly completed
         completed_log = filter(lambda change : change["Status"] in ["completed"],wfi.request['RequestTransition'])
         delay = (now_s - completed_log[-1]['UpdateTime']) / (60.*60.*24.) if completed_log else 0 ## in days
-        completed_delay = delay
+        completed_delay = delay ## this is for the workflow itself
         #onhold_completed_delay = delay
-        onhold_completed_delay = min_completed_delays
+        onhold_completed_delay = min_completed_delays ## this is for any workflows (itself, and ACDC) 
         onhold_timeout = UC.get('onhold_timeout')
 
-        print "onhold since",onhold_completed_delay,"timeout at",onhold_timeout
         if '-onhold' in wfo.status:
+            print "onhold since",onhold_completed_delay,"timeout at",onhold_timeout
             if onhold_timeout>0 and onhold_timeout<onhold_completed_delay:
                 bypass_checks = True
                 wfi.sendLog('checkor',"%s is on hold and stopped for %.2f days, letting this through with current statistics"%( wfo.name, onhold_completed_delay))
             else:
                 if wfo.name in holdings and not bypass_checks:
                     wfi.sendLog('checkor',"%s is on hold"%wfo.name)
-                    continue
+                    return
 
         if wfo.name in holdings and not bypass_checks:
             if onhold_timeout>0and onhold_timeout<onhold_completed_delay:
                 bypass_checks =True
                 wfi.sendLog('checkor',"%s is on hold and stopped for %.2f days, letting this through with current statistics"%( wfo.name, onhold_completed_delay))
             else:
-                wfo.status = 'assistance-onhold'
+                self.to_status = 'assistance-onhold'
                 wfi.sendLog('checkor',"setting %s on hold"%wfo.name)
-                session.commit()
-                continue
+                return
 
         tiers_with_no_check = copy.deepcopy(UC.get('tiers_with_no_check')) # dqm*
         vetoed_custodial_tier = copy.deepcopy(UC.get('tiers_with_no_custodial')) if not wfi.isRelval() else [] #no veto for relvals
@@ -555,7 +743,7 @@ def checkor(url, spec=None, options=None):
         #1% every damping_time days after > timeout_for_damping_fraction in completed. Not more than damping_fraction_pass_max
         #fraction_damping = min(0.01*(max(running_delay - timeout_for_damping_fraction,0)/damping_time),damping_fraction_pass_max)
         fraction_damping = min(0.01*(max(completed_delay - timeout_for_damping_fraction,0)/damping_time),damping_fraction_pass_max)
-        print "We could reduce the passing fraction by",fraction_damping,"given it's been in for long for long"
+        print "We could reduce the passing fraction by",fraction_damping,"given it's been in for long"
         long_lasting_choped = False
         for out in fractions_pass:
             if fractions_pass[out]!=1.0 and fraction_damping: ## strictly ones cannot be set less than one
@@ -708,7 +896,7 @@ def checkor(url, spec=None, options=None):
             if not bypass_checks:
                 ###############################
                 assistance_tags.add('recovery' if use_recoveror else 'manual')
-                in_manual += 0 if use_recoveror else 1
+                #in_manual += 0 if use_recoveror else 1
                 ###############################
                 is_closing = False
         else:
@@ -811,7 +999,12 @@ def checkor(url, spec=None, options=None):
 
             wfi.sendLog('checkor',mismatch_notice)
             if not 'recovering' in assistance_tags:
-                assistance_tags.add('filemismatch')
+                if min_completed_delays  < 2: ## less than 2 days in completed for any of the workflow of the prepid
+                    assistance_tags.add('agentfilemismatch')
+                else:
+                    assistance_tags.add('filemismatch')
+                if 'announce' in assistance_tags:
+                    assistance_tags.remove('announce')
                 #print this for show and tell if no recovery on-going
                 for out in dbs_presence:
                     _,_,missing_phedex,missing_dbs  = getDatasetFiles(url, out)
@@ -1001,8 +1194,8 @@ def checkor(url, spec=None, options=None):
                     if not len(custodial_locations[output]):
                         if phedex_presence[output]>=1:
                             wfi.sendLog('checkor','Using %s as a tape destination for %s'%(custodial, output))
-                            custodials[custodial].append( output )
-                            if group: custodials[custodial][-1]+='@%s'%group
+                            self.custodials[custodial].append( output )
+                            if group: self.custodials[custodial][-1]+='@%s'%group
                             ## let's wait and see if that's needed 
                             assistance_tags.add('custodial')
                             holding.append( output )
@@ -1048,20 +1241,16 @@ def checkor(url, spec=None, options=None):
         time_point("done with %s"%wfo.name)
 
         ## for visualization later on
-        if not wfo.name in fDB.record: 
-            #print "adding",wfo.name,"to close out record"
-            fDB.record[wfo.name] = {
+        put_record = {
             'datasets' :{},
             'name' : wfo.name,
-            'closeOutWorkflow' : None,
+            'closeOutWorkflow' : is_closing,
+            'priority' : wfi.request['RequestPriority'],
+            'prepid' :  wfi.request['PrepID'],
             }
-        fDB.record[wfo.name]['closeOutWorkflow'] = is_closing
-        fDB.record[wfo.name]['priority'] = wfi.request['RequestPriority']
-        fDB.record[wfo.name]['prepid'] = wfi.request['PrepID']
-
         for output in wfi.request['OutputDatasets']:
-            if not output in fDB.record[wfo.name]['datasets']: fDB.record[wfo.name]['datasets'][output] = {}
-            rec = fDB.record[wfo.name]['datasets'][output]
+            if not output in put_record['datasets']: put_record['datasets'][output] = {}
+            rec = put_record['datasets'][output]
             #rec['percentage'] = float('%.2f'%(percent_completions[output]*100))
             rec['percentage'] = math.floor(percent_completions[output]*10000)/100.## round down
             rec['fractionpass'] = math.floor(fractions_pass.get(output,0)*10000)/100.
@@ -1079,6 +1268,9 @@ def checkor(url, spec=None, options=None):
             now = time.gmtime()
             rec['timestamp'] = time.mktime(now)
             rec['updated'] = time.asctime(now)+' (GMT)'
+
+        #fDB.update( wfo.name, put_record)
+        self.put_record = put_record
 
         ## make the lumi summary 
         if wfi.request['RequestType'] == 'ReReco':
@@ -1128,12 +1320,15 @@ def checkor(url, spec=None, options=None):
                     
                 
                 if res in [None,"None"]:
-                    wfo.status = 'close'
-                    session.commit()
-                    if use_mcm and force_by_mcm:
+                    #wfo.status = 'close'
+                    self.to_status = 'close'
+                    #session.commit()
+                    #fDB.pop( wfo.name )
+                    self.force_by_mcm = force_by_mcm
+                    #if use_mcm and force_by_mcm:
                         ## shoot large on all prepids, on closing the wf
-                        for pid in pids:
-                            mcm.delete('/restapi/requests/forcecomplete/%s'%pid)
+                        #for pid in pids:
+                            #mcm.delete('/restapi/requests/forcecomplete/%s'%pid)
                 else:
                     print "could not close out",wfo.name,"will try again next time"
         else:
@@ -1143,10 +1338,11 @@ def checkor(url, spec=None, options=None):
                 for member in acdc+acdc_inactive+[wfo.name]:
                     try:
                         if options and options.no_report: continue
-                        expose = UC.get('n_error_exposed') if (report_created < 50 and 'manual' in assistance_tags) else 0
+                        #expose = UC.get('n_error_exposed') if (report_created < 50 and 'manual' in assistance_tags) else 0
+                        expose = UC.get('n_error_exposed') if ('manual' in assistance_tags) else 0
                         so = showError_options( expose = expose )
                         parse_one(url, member, so)
-                        report_created += 1
+                        self.report_created += 1
                     except Exception as e:
                         print "Could not make error report for",member
                         print "because",str(e)
@@ -1174,12 +1370,10 @@ def checkor(url, spec=None, options=None):
                 assistance_tags = assistance_tags - set(['recovery','recovered']) 
                 ## straight to manual
                 assistance_tags.add('manual')
-                in_manual += 1
             if 'recovery' in assistance_tags and 'manual' in assistance_tags:
                 ## this is likely because something bad is happening, so leave it to manual
                 assistance_tags = assistance_tags - set(['recovery'])
                 assistance_tags.add('manual')
-                in_manual += 1
             if 'custodial' in assistance_tags:
                 assistance_tags = assistance_tags - set(['announce','announced'])
 
@@ -1240,61 +1434,46 @@ def checkor(url, spec=None, options=None):
 
             ## case where the workflow was in manual from recoveror
             if not 'manual' in wfo.status or new_status!='assistance-recovery':
-                wfo.status = new_status
+                #wfo.status = new_status
                 if not options.test:
-                    wfi.sendLog('checkor','setting %s to %s'%(wfo.name, wfo.status))
-                    session.commit()
+                    wfi.sendLog('checkor','setting %s to %s'%(wfo.name, new_status))
+                    #session.commit()
+                    self.to_status = new_status
             else:
                 print "current status is",wfo.status,"not changing to anything"
         
-        ## a hook to halt checkor nicely at this stage
-        if os.path.isfile('.checkor_stop'):
-            print "The loop on workflows is shortened"
-            sendEmail('checkor','Checkor loop was shortened artificially using .checkor_stop')
-            os.system('rm -f .checkor_stop')
-            break
+            pop_a_jira = False
+            ## rereco and manual => jira
+            if 'manual' in self.to_status and 'ReReco' in wfi.request['RequestType']:
+                pop_a_jira = True
+            ## end of first round acdc => jira
+            if 'recovered' in self.to_status and 'manual' in self.to_status:
+                pop_a_jira = True
+            ## create a jira in certain cases
+            if pop_a_jira:
+                jiras = JC.find( {'prepid' : wfi.request['PrepID']})
+                j_comment = None
+                j = None
+                if len(jiras)==0:
+                    ## then you can create one
+                    j = JC.create( 
+                        {
+                            'priority' : wfi.request['RequestPriority'],
+                            'summary' : '%s issues'% wfi.request['PrepID'],
+                            'label' : 'WorkflowTrafficController',
+                            'description' : 'https://dmytro.web.cern.ch/dmytro/cmsprodmon/workflows.php?prep_id=%s \nAutomatic JIRA from unified'%( wfi.request['PrepID'])
+                        } 
+                    )
+                    j_comment = "Appears in %s"%(self.to_status)
+                else:
+                    ## pick up the last one
+                    print "a jira already exists, taking the last one"
+                    j = sorted(jiras, key= lambda o:JC.created(o))[-1]
+                    if JC.reopen(j.key):
+                        j_comment = "Came back in %s"%(self.to_status)
+                if j and j_comment:
+                    JC.comment(j.key,j_comment)
 
-    print report_created,"reports created in this run"
-
-    #if not options.clear:
-    if not options.go:
-        ## make the summary and sump only for other cases
-        fDB.html()
-
-    if not spec and in_manual!=0:
-        some_details = ""
-        if options.strict:
-            some_details +="Workflows which just got in completed were looked at. Look in manual.\n"
-        if options.update:
-            some_details +="Workflows that are still running (and not completed) got looked at.\n"
-        if options.clear:
-            some_details +="Workflows that just need to close-out were verified. Nothing too new a-priori.\n"
-        if options.review:
-            some_details +="Workflows under intervention got review.\n"
-        count_statuses = defaultdict(int)
-        for wfo in session.query(Workflow).filter(Workflow.status.startswith('assistance')).all():
-            count_statuses[wfo.status]+=1
-        some_details +='\n'.join(['%3d in status %s'%( count_statuses[st], st ) for st in sorted(count_statuses.keys())])
-        sendEmail("fresh assistance status available","Fresh status are available at %s/assistance.html\n%s"%(unified_url, some_details),destination=['katherine.rozo@cern.ch'])
-        #it's a bit annoying
-        pass
-
-    ## custodial requests
-    print "Custodials"
-    print json.dumps(custodials, indent=2)
-    for site in custodials:
-        items_at = defaultdict(set)
-        for i in custodials[site]:
-            item, group = i.split('@') if '@' in i else (i,'DataOps')
-            items_at[group].add( item )
-        for group,items in items_at.items():
-            print ','.join(items),'=>',site,'@',group
-            if not options.test:
-                result = makeReplicaRequest(url, site, sorted(items) ,"custodial copy at production close-out",custodial='y',priority='low', approve = (site in SI.sites_auto_approve) , group=group)
-                print result
-
-    print "File Invalidation"
-    print invalidations
 
 if __name__ == "__main__":
     url = reqmgr_url
@@ -1320,6 +1499,7 @@ if __name__ == "__main__":
     parser.add_option('--tape_size_limit', help='The limit in size of all outputs',default=0,type=int)
     parser.add_option('--html',help='make the monitor page',action='store_true', default=False)
     parser.add_option('--no_report',help='Prevent from making the error report',action='store_true', default=False)
+    parser.add_option('--threads',help='Number of threads for processing workflows',default=10, type=int)
     (options,args) = parser.parse_args()
     spec=None
     if len(args)!=0:

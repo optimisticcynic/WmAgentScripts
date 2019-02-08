@@ -27,12 +27,7 @@ from pprint import pprint
 
 import dbs3Client
 
-try:
-    import reqMgrClient
-except:
-    print "WMCore libraries not loaded, run the following command:"
-    print "source /data/srv/wmagent/current/apps/wmagent/etc/profile.d/init.sh"
-    sys.exit(0)
+import reqMgrClient
 
 reqmgrCouchURL = "https://cmsweb.cern.ch/couchdb/reqmgr_workload_cache"
 
@@ -46,24 +41,7 @@ def modifySchema(cache, workflow, user, group, events, firstLumi, backfill=False
     if backfill is True, modifies RequestString, ProcessingString, AcquisitionEra
     and Campaign to say Backfill, and restarts requestDate.
     """
-    # list of keys to be removed from the new request schema
-    paramBlacklist = ['BlockCloseMaxEvents', 'BlockCloseMaxFiles', 'BlockCloseMaxSize', 'BlockCloseMaxWaitTime',
-                      'CouchWorkloadDBName', 'CustodialGroup', 'CustodialSubType', 'Dashboard',
-                      'GracePeriod', 'HardTimeout', 'InitialPriority', 'inputMode', 'MaxMergeEvents', 'MaxMergeSize',
-                      'MaxRSS', 'MaxVSize', 'MinMergeSize', 'NonCustodialGroup','NonCustodialSubType',
-                      'OutputDatasets', 'ReqMgr2Only', 'RequestDate' 'RequestorDN', 'RequestName', 'RequestStatus',
-                      'RequestTransition', 'RequestWorkflow', 'SiteWhitelist', 'SoftTimeout', 'SoftwareVersions',
-                      'SubscriptionPriority', 'Team', 'timeStamp', 'TrustSitelists', 'TrustPUSitelists',
-                      'TotalEstimatedJobs', 'TotalInputEvents', 'TotalInputLumis', 'TotalInputFiles', 'DN',
-                      'AutoApproveSubscriptionSites', 'NonCustodialSites', 'CustodialSites', 'Teams',
-                      'OutputModulesLFNBases', 'AllowOpportunistic', 'InputDatasets', 'DeleteFromSource', '_id']
-
-    result = {}
-    for k, v in cache.iteritems():
-        if k in paramBlacklist or v in ([], {}, None, ''):
-            continue
-        else:
-            result[k] = v
+    result = reqMgrClient.purgeClonedSchema( cache )
 
     ## then further drop nested arguments
     taskParamBlacklist = [ 'EventsPerJob' ] 
@@ -116,8 +94,13 @@ def modifySchema(cache, workflow, user, group, events, firstLumi, backfill=False
         # Modify ProcessingString, AcquisitionEra, Campaign and Request string (if they don't
         # have the word 'backfill' in it
         result["ProcessingString"] = "BACKFILL"
-        if "backfill" not in result["AcquisitionEra"].lower():
-            result["AcquisitionEra"] = result["AcquisitionEra"] + "Backfill"
+        if isinstance(result["AcquisitionEra"],dict):
+            for eraName in result["AcquisitionEra"]:
+                if "backfill" not in result["AcquisitionEra"][eraName].lower():
+                    result["AcquisitionEra"][eraName] = result["AcquisitionEra"][eraName] + "Backfill"
+        else:
+            if "backfill" not in result["AcquisitionEra"].lower():
+                result["AcquisitionEra"] = result["AcquisitionEra"] + "Backfill"
         if "backfill" not in result["Campaign"].lower():
             result["Campaign"] = result["Campaign"] + "-Backfill"
         if "backfill" not in result["RequestString"].lower():

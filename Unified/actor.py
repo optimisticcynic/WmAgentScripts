@@ -1,7 +1,9 @@
 #!/usr/bin/env python
-from utils import workflowInfo, sendEmail, componentInfo, campaignInfo, unifiedConfiguration, siteInfo, sendLog, setDatasetStatus, moduleLock, getWorkflowById
+from assignSession import *
+from utils import workflowInfo, sendEmail, componentInfo, campaignInfo, unifiedConfiguration, siteInfo, sendLog, setDatasetStatus, moduleLock, invalidate, wtcInfo
 from utils import closeoutInfo, userLock
 import reqMgrClient
+import wtcClient
 import json
 import optparse
 import copy
@@ -11,29 +13,10 @@ import os
 from utils import reqmgr_url
 import httplib
 import ssl
+import sys
 import random
-
-def remove_action(*args):
-    if not os.path.exists('Unified/secret_act.txt'):
-        print 'Needs to be called from same directory as key.json'
-        exit()
-
-    with open('Unified/secret_act.txt', 'r') as key_file:
-        key_info = json.load(key_file)
-
-    conn = httplib.HTTPSConnection(key_info['url'], key_info['port'],
-                                   context=ssl._create_unverified_context())
-
-    conn.request(
-        'POST', key_info['path'],
-        json.dumps({'key': key_info['key'], 'workflows': args}),
-        {'Content-type': 'application/json'})
-
-    r= conn.getresponse().read()
-    print r 
-    conn.close()
-    return (r == 'Done')
-  
+from wtcClient import wtcClient
+from JIRAClient import JIRAClient
 
 def singleRecovery(url, task, initial, actions, do=False):
     print "Inside single recovery!"
@@ -41,7 +24,7 @@ def singleRecovery(url, task, initial, actions, do=False):
         "Requestor" : os.getenv('USER'),
         "Group" : 'DATAOPS',
         "RequestType" : "Resubmission",
-        "ACDCServer" : initial['CouchURL'],
+        "ACDCServer" : initial['ConfigCacheUrl'],
         "ACDCDatabase" : "acdcserver",
         "OriginalRequestName" : initial['RequestName'],
         "OpenRunningTimeout" : 0
@@ -191,6 +174,7 @@ def singleRecovery(url, task, initial, actions, do=False):
             sendLog('actor','Failed twice in making ACDCs for %s!'%initial['RequestName'],level='critical')                
             return None
 
+
     ## change splitting if requested
     if actions:
         for action in actions:
@@ -257,29 +241,8 @@ def singleClone(url, wfname, actions, comment, do=False):
     else:
         payload['ProcessingVersion'] = 2
 
-
-## drop parameters on the way to reqmgr2
-    paramBlacklist = ['BlockCloseMaxEvents', 'BlockCloseMaxFiles', 'BlockCloseMaxSize', 'BlockCloseMaxWaitTime',
-                  'CouchWorkloadDBName', 'CustodialGroup', 'CustodialSubType', 'Dashboard',
-                  'GracePeriod', 'HardTimeout', 'InitialPriority', 'inputMode', 'MaxMergeEvents', 'MaxMergeSize',
-                  'MaxRSS', 'MaxVSize', 'MinMergeSize', 'NonCustodialGroup', 'NonCustodialSubType',
-                  'OutputDatasets', 'ReqMgr2Only', 'RequestDate' 'RequestorDN', 'RequestName', 'RequestStatus',
-                  'RequestTransition', 'RequestWorkflow', 'SiteWhitelist', 'SoftTimeout', 'SoftwareVersions',
-                  'SubscriptionPriority', 'Team', 'timeStamp', 'TrustSitelists', 'TrustPUSitelists',
-                  'TotalEstimatedJobs', 'TotalInputEvents', 'TotalInputLumis', 'TotalInputFiles','checkbox',
-                  'DN', 'AutoApproveSubscriptionSites', 'NonCustodialSites', 'CustodialSites', 'OriginalRequestName', 'Teams', 'OutputModulesLFNBases', 
-                      'SiteBlacklist', 'AllowOpportunistic', '_id', 'Override']
-    for p in paramBlacklist:
-        if p in payload:
-            payload.pop( p )
-
-    taskParamBlacklist = [ 'EventsPerJob' ] 
-    for i in range(1,100):
-        t='Task%s'%i
-        if not t in payload: break
-        for p in taskParamBlacklist:
-            if p in payload[t]:
-                payload[t].pop( p )
+        
+    payload = reqMgrClient.purgeClonedSchema( payload )
 
     if actions:
         for action in actions:
@@ -359,6 +322,7 @@ def singleClone(url, wfname, actions, comment, do=False):
     data = reqMgrClient.setWorkflowApproved(url, clone)
     wfi.sendLog('actor','Cloned into %s'%clone)
 
+    
 #    wfi.sendLog('actor','Cloned into %s by unified operator %s'%( clone, comment ))
 #    wfi.notifyRequestor('Cloned into %s by unified operator %s'%( clone, comment ),do_batch=False)
 
@@ -369,27 +333,25 @@ def singleClone(url, wfname, actions, comment, do=False):
 
 def actor(url,options=None):
     
-    if  moduleLock(wait=False ,silent=True)(): return
+    mlock = moduleLock(wait=False ,silent=True)
+    if mlock(): return
     if userLock('actor'): return
     
-    up = componentInfo(mcm=False, soft=['mcm'])
+    up = componentInfo(soft=['mcm'])
     if not up.check(): return
     
    # CI = campaignInfo()
     SI = siteInfo()
     UC = unifiedConfiguration()
-    
-    # Need to look at the actions page https://vocms0113.cern.ch:80/getaction (can add ?days=20) and perform any actions listed
-    try:
-        action_list = json.loads(os.popen('curl -s -k https://vocms0113.cern.ch:80/getaction?days=15').read())
-        ## now we have a list of things that we can take action on
-    except:
-        try:
-            action_list = json.loads(os.popen('curl -s -k https://vocms0113.cern.ch/getaction?days=15').read())
-        except:
-            print "Not able to load action list :("
-            sendLog('actor','Not able to load action list', level='critical')
-            return
+    WC = wtcClient()
+    WI = wtcInfo()
+    JC = JIRAClient()
+
+    action_list = WC.get_actions()
+    if action_list is None:
+        print "Not able to load action list"
+        sendLog('actor','Not able to load action list', level='critical')
+        return
 
     if options.actions:
         action_list = json.loads(open(options.actions).read())
@@ -444,30 +406,18 @@ def actor(url,options=None):
         if to_clone and options.do:
             print "Let's try kill and clone: "
             wfi.sendLog('actor','Going to clone %s'%wfname)
-            results=[]
-            datasets = set(wfi.request['OutputDatasets'])
-
             comment=""
-
             if 'comment' in tasks: comment = ", reason: "+ tasks['comment']
             wfi.sendLog('actor',"invalidating the workflow by traffic controller %s"%comment)
 
             #Reject all workflows in the family
-            #first reject the original workflow.
-            reqMgrClient.invalidateWorkflow(url, wfi.request['RequestName'], current_status=wfi.request['RequestStatus'], cascade=False)
-            #Then reject any ACDCs associated with that workflow
-            family = getWorkflowById( url, wfi.request['PrepID'] , details=True)
-            for fwl in family:
-                print "rejecting",fwl['RequestName'],fwl['RequestStatus']
-                wfi.sendLog('actor',"rejecting %s, previous status %s"%(fwl['RequestName'],fwl['RequestStatus']))
-                reqMgrClient.invalidateWorkflow(url, fwl['RequestName'], current_status=fwl['RequestStatus'], cascade=False)
-                datasets.update( fwl['OutputDatasets'] )
-            #Invalidate all associated output datasets
-            for dataset in datasets:
-                results.append( setDatasetStatus(dataset, 'INVALID') )
-
-            if all(map(lambda result : result in ['None',None,True],results)):
+            inv_results = invalidate(url, wfi, only_resub=False, with_output=True)
+            all_good = all(inv_results)
+            if all_good:
                 wfi.sendLog('actor',"%s and children are rejected"%wfname)
+            else:
+                sendLog('actor','Failed to reject the familly of %s'% wfname, level='critical')
+                continue
 
             cloned = None
             try:  
@@ -477,7 +427,6 @@ def actor(url,options=None):
                 wfi.sendLog('actor','Failed to create clone for %s!'%wfname)
                 print str(e)
                 ##let's not remove the action other the workflow goes to "trouble" and the WTC cannot set the action again
-                #remove_action(wfname)
             if not cloned:
                 recover = False
                 wfi.sendLog('actor','Failed to create clone for %s!'%wfname)
@@ -485,18 +434,17 @@ def actor(url,options=None):
 
             else:
                 wfi.sendLog('actor',"Workflow %s cloned"%wfname)
-
+                ## set to trouble for swift replacement
+                for wfo in  session.query(Workflow).filter(Workflow.name == wfname).all():
+                    wfo.status = 'trouble'
+                session.commit()
 #===========================================================
         elif to_force:
-            wfi.sendLog('actor','Bypassing from workflow traffic controler request')
-            forcing = json.loads(open('/afs/cern.ch/user/v/vlimant/public/ops/forcecomplete.json').read())
-            forcing.append( wfname )
-            open('/afs/cern.ch/user/v/vlimant/public/ops/forcecomplete.json','w').write( json.dumps( sorted(set(forcing)) ))
+            wfi.sendLog('actor','Force-completing from workflow traffic controler request')
+            WI.add(action='force', keyword = wfname, user = action_list[wfname].get( 'user', 'unified'))
         elif to_hold:
             wfi.sendLog('actor','Holding on workflow traffic controler request')
-            holding = json.loads(open('/afs/cern.ch/user/v/vlimant/public/ops/onhold.json').read())
-            holding.append( wfname )
-            open('/afs/cern.ch/user/v/vlimant/public/ops/onhold.json','w').write( json.dumps( sorted(set(holding)) ))
+            WI.add(action='hold', keyword = wfname, user = action_list[wfname].get( 'user', 'unified'))                   
 #===========================================================
         elif to_acdc:
             if 'AllSteps' in tasks:
@@ -530,6 +478,9 @@ def actor(url,options=None):
                 where_to_run, missing_to_run,missing_to_run_at =  wfi.getRecoveryInfo()
                 print "Where to run = "
                 print where_to_run
+                if not where_to_run:
+                    sendLog('actor','Cannot create ACDCS for %s because recovery info cannot be found.'%wfname,level='critical')
+                    continue
             except:
                 sendLog('actor','Cannot create ACDCS for %s because recovery info cannot be found.'%wfname,level='critical')
                 print "Moving on. Cannot access recovery info for " + wfname
@@ -576,13 +527,17 @@ def actor(url,options=None):
                 assign_to_sites = set()
                 print "Task names is " + task
                 fulltaskname = '/' + wfname + '/' + task
-#                print "Full task name is " + fulltaskname
+                print "Full task name is " + fulltaskname
+                print where_to_run.keys()
                 wrong_task = False
                 for task_info in all_tasks:
                     if fulltaskname == task_info.pathName:
                         if task_info.taskType not in ['Processing','Production','Merge']:
-                            wrong_task=True
+                            wrong_task= True
                             wfi.sendLog('actor', "Skipping task %s because the taskType is %s. Can only ACDC Processing, Production, or Merge tasks"%( fulltaskname, task_info.taskType))
+                if not fulltaskname in where_to_run.keys():
+                    wrong_task= True
+                    wfi.sendLog('actor', "Skipping task %s because there is no acdc doc for it anyways."%(fulltaskname), level='critical')
                 if wrong_task:
                     continue
                 print tasks[task]
@@ -628,6 +583,15 @@ def actor(url,options=None):
 
                     else: #ACDC was made correctly. Now we have to assign it.
                         wfi.sendLog('actor','ACDC created for task %s. Actions taken \n%s'%(fulltaskname,json.dumps(actions)))
+                        jira_comment = "%s created ACDC for task %s with action %s"%( 
+                            action_list[wfname].get( 'user', 'unified'),
+                            task.split('/')[-1] , 
+                            json.dumps(actions),
+                        )
+                        reason = action_list[wfname].get( 'Reason', None)
+                        if reason:
+                            jira_comment += '\ndue to: %s'%(reason)
+
                         #team = wfi.request['Teams'][0]
                         team = 'production'
                         parameters={
@@ -681,12 +645,33 @@ def actor(url,options=None):
                             sendLog('actor',"%s needs to be assigned"%(acdc), level='critical')
                         else:
                             recovering.add( acdc )
-                        wfi.sendLog('actor',"ACDCs created for %s"%wfname)
+                        #wfi.sendLog('actor',"ACDCs created for %s"%wfname)
+                        try:
+                            if jira_comment:
+                                jiras = JC.find({'prepid' : wfi.request['PrepID']})
+                                if len(jiras)==1:
+                                    ## put a comment on the single corresponding ticket
+                                    JC.comment(jiras[0].key, jira_comment)
+                                    JC.progress(jiras[0].key)
+                        except Exception as e:
+                            print "failed with JIRA"
+                            print str(e)
+                        
+    
         #===========================================================
         
         
         if recover and options.do:
-            remove_action(wfname)
+            r = WC.remove_action(wfname)
+            if not r:
+                sendLog('actor','not able to remove the action, interlocking the module', level='critical')
+                os.system('touch %s/actor.failed-%s.lock'%( base_eos_dir, os.getpid() ))
+                sys.exit(-1)
+
+        ## update the status with recovering removing manual
+        for wfo in  session.query(Workflow).filter(Workflow.name == wfname).all():
+            wfo.status = wfo.status.replace('manual','recovering')
+        session.commit()                        
 
         if message_to_user:
             print wfname,"to be notified to user(DUMMY)",message_to_user

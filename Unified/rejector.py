@@ -2,9 +2,9 @@
 from assignSession import *
 import sys
 import reqMgrClient
-from utils import workflowInfo, setDatasetStatus
+from utils import workflowInfo, setDatasetStatus, invalidate
 from utils import componentInfo, reqmgr_url, getWorkflowById
-from utils import componentInfo, getWorkflowById, sendLog
+from utils import componentInfo, getWorkflowById, sendLog, batchInfo
 import optparse
 import json
 import re
@@ -12,12 +12,9 @@ import os
 
 def rejector(url, specific, options=None):
 
-    #use_mcm = True
-    #up = componentInfo(mcm=use_mcm, soft=['mcm'])
-    up = componentInfo()
+    
+    up = componentInfo(soft=['wtc'])
     if not up.check(): return
-    #use_mcm = up.status['mcm']
-    #mcm = McMClient(dev=False) if use_mcm else None
 
     if specific and specific.startswith('/'):
         ## this is for a dataset
@@ -32,11 +29,14 @@ def rejector(url, specific, options=None):
     elif specific:
         wfs = session.query(Workflow).filter(Workflow.name.contains(specific)).all()
         if not wfs:
-            batches = json.loads(open('batches.json').read())
+            batches = batchInfo().content()
             for bname in batches:
                 if specific == bname:
-                    for wf in batches[bname]:
-                        wfs.append( session.query(Workflow).filter(Workflow.name == wf).first())
+                    for pid in batches[bname]:
+                        b_wfs = getWorkflowById(url, pid)
+                        for wf in b_wfs:
+                            wfs.append( session.query(Workflow).filter(Workflow.name == wf).first())
+                    break
     else:
         wfs = session.query(Workflow).filter(Workflow.status == 'assistance-clone').all()
         #wfs.extend( session.query(Workflow).filter(Workflow.status == 'assistance-reject').all())
@@ -58,35 +58,18 @@ def rejector(url, specific, options=None):
         if not wfo:
             print "cannot reject",spec
             return
-        results=[]
         wfi = workflowInfo(url, wfo.name)
-
-        datasets = set(wfi.request['OutputDatasets'])
-        reqMgrClient.invalidateWorkflow(url, wfo.name, current_status=wfi.request['RequestStatus'])
 
         comment=""
         if options.comments: comment = ", reason: "+options.comments
-        wfi.sendLog('rejector','invalidating the workflow by unified operator%s'%comment)
-        ## need to find the whole familly and reject the whole gang
-        familly = getWorkflowById( url, wfi.request['PrepID'] , details=True)
-        for fwl in familly:
-            if fwl['RequestDate'] < wfi.request['RequestDate']: continue
-            if fwl['RequestType']!='Resubmission': continue
-            ## does not work on second order acd
-            #if 'OriginalRequestName' in fwl and fwl['OriginalRequestName'] != wfi.request['RequestName']: continue
-            print "rejecting",fwl['RequestName']
-            reqMgrClient.invalidateWorkflow(url, fwl['RequestName'], current_status=fwl['RequestStatus'], cascade=False)
-            datasets.update( fwl['OutputDatasets'] )
+        if options.keep: 
+            wfi.sendLog('rejector','invalidating the workflow by unified operator%s'%comment)
+        else:
+            wfi.sendLog('rejector','invalidating the workflow and outputs by unified operator%s'%comment)
 
-        for dataset in datasets:
-            if options.keep:
-                print "keeping",dataset,"in its current status"
-            else:
-                results.append( setDatasetStatus(dataset, 'INVALID') )
-                pass
+        results = invalidate(url, wfi, only_resub=True, with_output= (not options.keep))
 
-
-        if all(map(lambda result : result in ['None',None,True],results)):
+        if all(results):
             print wfo.name,"and",datasets,"are rejected"
             if options and options.clone:
                 wfo.status = 'trouble'
@@ -183,30 +166,7 @@ def rejector(url, specific, options=None):
                 schema['RequestPriority'] = wfi.request['RequestPriority']
 
                 ## drop shit on the way to reqmgr2
-                paramBlacklist = ['BlockCloseMaxEvents', 'BlockCloseMaxFiles', 'BlockCloseMaxSize', 'BlockCloseMaxWaitTime',
-                                  'CouchWorkloadDBName', 'CustodialGroup', 'CustodialSubType', 'Dashboard',
-                                  'GracePeriod', 'HardTimeout', 'InitialPriority', 'inputMode', 'MaxMergeEvents', 'MaxMergeSize',
-                                  'MaxRSS', 'MaxVSize', 'MinMergeSize', 'NonCustodialGroup', 'NonCustodialSubType',
-                                  'OutputDatasets', 'ReqMgr2Only', 'RequestDate' 'RequestorDN', 'RequestName', 'RequestStatus',
-                                  'RequestTransition', 'RequestWorkflow', 'SiteWhitelist', 'SoftTimeout', 'SoftwareVersions',
-                                  'SubscriptionPriority', 'Team', 'timeStamp', 'TrustSitelists', 'TrustPUSitelists',
-                                  'TotalEstimatedJobs', 'TotalInputEvents', 'TotalInputLumis', 'TotalInputFiles',
-                                  ## and the new parameter validation scheme
-                                  'DN', 'AutoApproveSubscriptionSites', 'NonCustodialSites', 'CustodialSites', 
-                                  'OriginalRequestName', 'IgnoredOutputModules', 'OutputModulesLFNBases', 'SiteBlacklist', 'AllowOpportunistic', '_id',
-                                  'min_merge_size', 'events_per_lumi', 'max_merge_size', 'max_events_per_lumi', 'max_merge_events', 'max_wait_time', 'events_per_job',
-                                  'SiteBlacklist', 'AllowOpportunistic', 'Override']
-                for p in paramBlacklist:
-                    if p in schema:
-                        schema.pop( p )
-
-                taskParamBlacklist = [ 'EventsPerJob' ] 
-                for i in range(1,100):
-                    t='Task%s'%i
-                    if not t in schema: break
-                    for p in taskParamBlacklist:
-                        if p in schema[t]:
-                            schema[t].pop( p )
+                schema = reqMgrClient.purgeClonedSchema( schema )
 
                 print "submitting"
                 if (options.to_stepchain and (schema['RequestType']=='TaskChain')):

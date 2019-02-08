@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 from assignSession import *
-from utils import getWorkflows, getWorkflowById, getWorkLoad, componentInfo, sendEmail, workflowInfo, sendLog, reqmgr_url, getDatasetStatus, unifiedConfiguration, duplicateLock, do_html_in_each_module, getDatasetFiles
+from utils import getWorkflows, getWorkflowById, getWorkLoad, componentInfo, sendEmail, workflowInfo, sendLog, reqmgr_url, getDatasetStatus, unifiedConfiguration, moduleLock, do_html_in_each_module, getDatasetFiles
 import sys
 import copy
 import os
@@ -12,10 +12,11 @@ import time
 from collections import defaultdict
 
 def injector(url, options, specific):
-    if duplicateLock(): return 
+    mlock = moduleLock()
+    if mlock(): return
 
     use_mcm = True
-    up = componentInfo( mcm = use_mcm, soft=['mcm'] )
+    up = componentInfo(soft=['mcm','wtc'] )
     if not up.check(): return
     use_mcm = up.status['mcm']
 
@@ -101,10 +102,10 @@ def injector(url, options, specific):
 
 
             ## match keywords and technical constraints
-            if (not options.no_convert) and good_for_stepchain:
-                to_convert.add( wf )
-                wfi.sendLog('injector','Transforming %s TaskChain into StepChain'%wf)
-                #sendEmail('convertion to stepchain','Transforming %s TaskChain into StepChain'%wf)
+            #if (not options.no_convert) and good_for_stepchain and not wfi.isRelval():
+            #    to_convert.add( wf )
+            #    wfi.sendLog('injector','Transforming %s TaskChain into StepChain'%wf)
+            #    #sendEmail('convertion to stepchain','Transforming %s TaskChain into StepChain'%wf)
 
             wfi.sendLog('injector',"considering %s"%wf)
 
